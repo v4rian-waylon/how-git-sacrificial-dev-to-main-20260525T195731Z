@@ -1,0 +1,18 @@
+{
+  "_comment": "v4rian pool/* creation restriction. Pins pool/* ref creation to the allocator workflow's identity (the repo's github-actions[bot] using the default GITHUB_TOKEN). Developer pushes of pool/* refs from laptops are rejected at the server. Bypass via the workflow run is the only allowed path; the workflow validates the actor and then creates both pool/[vYYYY.MAIN/]nN.* and safety/[vYYYY.MAIN/]nN.* atomically. The include patterns cover both layouts: legacy flat refs/heads/pool/<suffix> and current refs/heads/pool/<vYYYY.MAIN>/<suffix> (the major-version prefix that mirrors the vault and archived-safety schemes). Apply via .io.v4rian.how-git/scripts/apply-repo-rules.sh, or POST directly to /repos/{owner}/{repo}/rulesets after substituting the {ACTOR_ID} placeholder with the integration id of the GitHub Actions bot on the target repo (gh api /orgs/{org}/installations --jq '.installations[] | select(.app_slug==\"github-actions\") | .id').",
+  "name": "v4rian-pool-creations",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": ["refs/heads/pool/*", "refs/heads/pool/*/*"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    { "type": "creation" }
+  ],
+  "bypass_actors": [
+    { "actor_id": "{ACTOR_ID_GITHUB_ACTIONS}", "actor_type": "Integration", "bypass_mode": "always" }
+  ]
+}

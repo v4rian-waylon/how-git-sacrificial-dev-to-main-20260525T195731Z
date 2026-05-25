@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# doctor - one-shot health check of the v4rian repo setup.
+#
+# Default mode (fast, seconds): structural checks.
+#   - core.hooksPath set correctly
+#   - every shipped bin exists + executable
+#   - every shipped script exists + executable
+#   - every shipped hook exists + executable
+#   - every CI workflow file present
+#   - no stray VERSION file at repo root
+#   - no stray SERIES file at repo root (SERIES is auto-derived from main merges; the file is obsolete)
+#   - git remote origin configured
+#   - python3 + gh CLI available (for full functionality)
+#
+# Deep mode (slow, ~1m+): behavioral diagnostics.
+#   - Runs .io.v4rian.how-git/framework-tests/test-lifecycle.sh + test-hooks.sh against this
+#     install. These ARE the framework's own tests that pool/n45 set up
+#     to skip on consumer CI; here they serve as on-demand diagnostics
+#     so an operator can verify the framework is functionally intact
+#     (claim flow, hooks, audits, rulesets, mode-flip, vault scheme, etc.)
+#     without waiting for the framework's own CI to be the proof. Run
+#     it when something feels wrong or after upgrading the framework.
+#
+# Exits 0 if healthy, non-zero with a list of issues otherwise.
+#
+# Usage:
+#   doctor                  human-readable structural report (default)
+#   doctor --quiet          structural mode, exit code only
+#   doctor --deep           structural + behavioral diagnostics
+#   doctor --deep --quiet   exit code only
+#   doctor -h | --help
+
+set -uo pipefail
+
+usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X doctor: not inside a git repo" >&2
+  exit 2
+fi
+
+QUIET=false
+DEEP=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --quiet) QUIET=true; shift ;;
+    --deep)  DEEP=true; shift ;;
+    -h|--help) usage ;;
+    *) echo "X unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+cd "$REPO_ROOT"
+
+ISSUES=()
+
+check_exec() {
+  local f="$1"
+  if [ ! -e "$f" ]; then
+    ISSUES+=("missing: $f")
+  elif [ ! -x "$f" ]; then
+    ISSUES+=("not executable: $f")
+  fi
+}
+
+check_file() {
+  local f="$1"
+  [ ! -e "$f" ] && ISSUES+=("missing: $f")
+}
+
+# core.hooksPath
+HOOKS_PATH=$(git config core.hooksPath 2>/dev/null || true)
+if [ "$HOOKS_PATH" != ".io.v4rian.how-git/githooks" ]; then
+  ISSUES+=("core.hooksPath = '${HOOKS_PATH:-unset}' (expected .io.v4rian.how-git/githooks); run heal.sh")
+fi
+
+# Bins
+for b in version status ship release-of doctor queue changelog preview-merge; do
+  check_exec ".io.v4rian.how-git/bin/$b"
+done
+
+# Scripts (REQUIRED)
+for s in claim-dev-merge.sh claim-main-release.sh auto-rebase-pools-after-dev-merge.sh \
+         open-pr.sh apply-repo-rules.sh \
+         heal.sh verify-template.sh; do
+  check_exec ".io.v4rian.how-git/scripts/$s"
+done
+
+# Scripts (OPTIONAL - present in some template revisions, absent in others)
+for s in archive-pool-branch.sh build.sh distribute-internal.sh distribute-public.sh; do
+  # Don't ISSUE on missing; only flag if present-but-not-executable
+  if [ -e ".io.v4rian.how-git/scripts/$s" ] && [ ! -x ".io.v4rian.how-git/scripts/$s" ]; then
+    ISSUES+=("not executable: .io.v4rian.how-git/scripts/$s")
+  fi
+done
+
+# Hooks
+for h in pre-push post-checkout commit-msg post-merge; do
+  check_exec ".io.v4rian.how-git/githooks/$h"
+done
+
+# Workflows REQUIRED for core lifecycle
+#
+# Pool/n55 migrated the per-trigger workflow yamls (audit-pushed-branch,
+# test, claim-on-merge-dev, claim-on-merge-main, build-on-tag) into a
+# layered ci/{tests,audits}/<trigger>/ harness fronted by ci-dispatch.yml.
+# What survives at the workflow layer is the dispatcher itself plus the
+# bookkeeping workflows that can't be expressed as required.* scripts
+# (allocator, seed-dev, pr-open validator). The required-check + claim +
+# tag-build behavior now lives as required.*.sh entries under the sys
+# layer at .io.v4rian.how-git/ci/.
+for w in ci-dispatch.yml validate-pr-open.yml; do
+  check_file ".github/workflows/$w"
+done
+
+# Sys-layer required.* dispatchers REQUIRED for core lifecycle
+# (each one fronts an audit/test/claim/build recipe through ci-dispatch.yml)
+for s in \
+  ci/audits/push/required.compile.sh \
+  ci/audits/push/required.coverage.sh \
+  ci/audits/push/required.runtime.sh \
+  ci/tests/push/required.offline-test-suites.sh \
+  ci/audits/pr-merge-dev/required.claim.sh \
+  ci/audits/pr-merge-main/required.claim.sh \
+  ci/audits/tag/required.build.sh; do
+  check_exec ".io.v4rian.how-git/$s"
+done
+
+# Workflows OPTIONAL (template-revision-dependent)
+for w in allocate-pool-branch.yml seed-dev-on-main-create.yml; do
+  : # presence-not-required
+done
+
+# No stray VERSION file
+if [ -f VERSION ]; then
+  ISSUES+=("stray VERSION file at repo root (tags-as-seal model: bin/version is the source); rm VERSION")
+fi
+
+# No stray SERIES file (SERIES is auto-derived from main merge count by bin/version;
+# the file is obsolete under the new model and any presence is a leftover from legacy).
+if [ -f SERIES ]; then
+  ISSUES+=("stray SERIES file at repo root (SERIES is auto-derived from main merge count by bin/version; the file is ignored and should be deleted)")
+fi
+
+# v4rian mode flag
+if [ ! -f .io.v4rian.how-git/MODE ]; then
+  ISSUES+=(".io.v4rian.how-git/MODE missing (defaults to connected; create the file or run bin/set-mode connected)")
+else
+  MODE_VAL=$(tr -d '\n' < .io.v4rian.how-git/MODE)
+  case "$MODE_VAL" in
+    connected|off-grid) ;;
+    *) ISSUES+=(".io.v4rian.how-git/MODE has invalid value '$MODE_VAL' (expected: connected or off-grid)") ;;
+  esac
+fi
+
+# git remote origin
+if ! git config --get remote.origin.url >/dev/null 2>&1; then
+  ISSUES+=("no git remote 'origin' configured")
+fi
+
+# Optional but recommended tools
+command -v python3 >/dev/null 2>&1 || ISSUES+=("python3 not installed (required for several scripts)")
+command -v gh      >/dev/null 2>&1 || ISSUES+=("gh CLI not installed (required for queue, ship, auto-rebase)")
+command -v curl    >/dev/null 2>&1 || ISSUES+=("curl not installed (fallback path for some scripts)")
+
+structural_rc=0
+if [ ${#ISSUES[@]} -gt 0 ]; then
+  structural_rc=1
+  if ! $QUIET; then
+    echo "issues:"
+    for i in "${ISSUES[@]}"; do
+      echo "  - $i"
+    done
+  fi
+elif ! $QUIET; then
+  echo "ok: v4rian repo health check passed (all bins/scripts/hooks/workflows present + executable)"
+fi
+
+# Deep mode: behavioral diagnostics via the framework's test suites.
+# These suites ship at .io.v4rian.how-git/framework-tests/ on the framework source repo
+# AND on consumer installs (per pool/n47 — they stay on consumers as
+# diagnostic tools, not as CI-fires-on-every-push tests). The
+# offline-test workflow gates auto-runs on the FRAMEWORK_REPO marker
+# so consumers never run them via CI; bin/doctor --deep runs them
+# on demand when an operator wants to verify "is my install actually
+# functional, not just structurally complete?"
+deep_rc=0
+if $DEEP; then
+  if ! $QUIET; then
+    echo ""
+    echo "=> deep diagnostics: running .io.v4rian.how-git/framework-tests/ suites (~1m+)"
+  fi
+  if [ ! -d .io.v4rian.how-git/framework-tests ]; then
+    if ! $QUIET; then
+      echo "  warn: .io.v4rian.how-git/framework-tests/ directory absent — install may be incomplete"
+    fi
+    deep_rc=2
+  else
+    if [ -x .io.v4rian.how-git/framework-tests/test-lifecycle.sh ]; then
+      if $QUIET; then
+        LIFECYCLE_TEST_MODE=1 bash .io.v4rian.how-git/framework-tests/test-lifecycle.sh >/dev/null 2>&1 || deep_rc=1
+      else
+        echo "  -> .io.v4rian.how-git/framework-tests/test-lifecycle.sh"
+        LIFECYCLE_TEST_MODE=1 bash .io.v4rian.how-git/framework-tests/test-lifecycle.sh 2>&1 | tail -5
+        LIFECYCLE_TEST_MODE=1 bash .io.v4rian.how-git/framework-tests/test-lifecycle.sh >/dev/null 2>&1 || deep_rc=1
+      fi
+    fi
+    if [ -x .io.v4rian.how-git/framework-tests/test-hooks.sh ]; then
+      if $QUIET; then
+        bash .io.v4rian.how-git/framework-tests/test-hooks.sh >/dev/null 2>&1 || deep_rc=1
+      else
+        echo "  -> .io.v4rian.how-git/framework-tests/test-hooks.sh"
+        bash .io.v4rian.how-git/framework-tests/test-hooks.sh 2>&1 | tail -3
+        bash .io.v4rian.how-git/framework-tests/test-hooks.sh >/dev/null 2>&1 || deep_rc=1
+      fi
+    fi
+    if ! $QUIET; then
+      if [ "$deep_rc" -eq 0 ]; then
+        echo "ok: deep diagnostics passed (framework-tests green)"
+      else
+        echo "X deep diagnostics failed (framework-tests red — your install may have drift)"
+      fi
+    fi
+  fi
+fi
+
+# Final exit: union of structural + deep
+if [ "$structural_rc" -ne 0 ] || [ "$deep_rc" -ne 0 ]; then
+  exit 1
+fi
+exit 0

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# commit-msg - cheap, deterministic subject-length guardrail.
+#
+# Under the new commit stage model (Step 2 of the lifecycle), the
+# heavy commit auditing has moved out of this hook. The smart
+# auto-fix layer runs at prepare-commit-msg (message rewrites) and
+# pre-commit (staged file scrubs), and the deterministic compile /
+# coverage / runtime audits run async in CI via
+# audit-pushed-branch.yml. This hook now keeps only the one check
+# that costs nothing and adds value: subject length within bounds.
+#
+# Hand-written commits stay at 8-100 chars to keep kernel-style
+# discipline. Auto-generated subjects from the claim flow and the
+# allocator carry the full pool ref name plus a version segment;
+# under the pool/vYYYY.MAIN/ prefix layout those subjects naturally
+# overflow 100 chars even with reasonably short slugs, so the two
+# known machine-generated prefixes are allowed up to 140 chars.
+
+set -euo pipefail
+
+msg_file="$1"
+subj=$(head -n1 "$msg_file")
+len=${#subj}
+
+case "$subj" in
+  "[MERGE] "*|"[REQ] "*) max=140 ;;
+  *)                     max=100 ;;
+esac
+
+if (( len < 8 || len > max )); then
+  echo "X Commit subject must be 8-${max} chars (got $len)"
+  echo "  Subject: $subj"
+  exit 1
+fi

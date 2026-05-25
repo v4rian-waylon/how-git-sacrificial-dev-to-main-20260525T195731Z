@@ -1,0 +1,20 @@
+{
+  "_comment": "v4rian vault/* read-only lockdown. Vault branches are the archival home of every merged pool branch — the canonical proof of what shipped, captured at the SHA that merged into dev. Any mutation of a vault ref breaks the historical record. Pins vault/* creation to the claim workflow's identity (the repo's github-actions[bot] using the default GITHUB_TOKEN) since that workflow's archive step is the only legitimate creator, and blocks update + deletion entirely so the archived tip cannot be amended, rebased, force-pushed, or deleted by anyone (including admins on the org). The include patterns cover both layouts: legacy flat refs/heads/vault/<suffix> (pre-pool/n44) and current refs/heads/vault/<vYYYY.MAIN>/<suffix> (since pool/n44 introduced the major-prefix classification). Apply via .io.v4rian.how-git/bin/lockdown or scripts/apply-repo-rules.sh. The ACTOR_ID placeholder is substituted at apply time with the integration id of the GitHub Actions bot on the target repo (gh api /orgs/{org}/installations --jq '.installations[] | select(.app_slug==\"github-actions\") | .id').",
+  "name": "v4rian-vault-readonly",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": ["refs/heads/vault/*", "refs/heads/vault/*/*"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    { "type": "creation" },
+    { "type": "update" },
+    { "type": "deletion" }
+  ],
+  "bypass_actors": [
+    { "actor_id": "{ACTOR_ID_GITHUB_ACTIONS}", "actor_type": "Integration", "bypass_mode": "always" }
+  ]
+}

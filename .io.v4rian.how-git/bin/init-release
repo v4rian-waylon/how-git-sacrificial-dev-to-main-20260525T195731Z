@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# init-release — local CLI for opening a dev → main release PR.
+#
+# Sibling of bin/init-pool-merge that handles the dev to main promotion.
+# Pre-fills the PR body from the CHANGELOG Unreleased section so the
+# release report carries the curated narrative that landed cycle by
+# cycle on dev, then dispatches gh pr create against main. The same
+# validate-pr-open workflow that handles pool to dev PRs fires server
+# side: it amends the title to the canonical MERGE dev into main form
+# with the release version from bin/version, runs the auto-fix pass
+# over the body, embeds the signature, and posts the required status
+# check.
+#
+# Releases are intentional decisions; this CLI opens the PR but the
+# admin still merges manually through the GitHub UI after every status
+# check is green. The validate-pr-open workflow only governs the open
+# event; merge gating lives in the dev branch ruleset.
+#
+# Behavior:
+#
+#   * Verifies current branch is dev. PRs into main from any other
+#     source are rejected by the workflow; the script catches it early
+#     for a kinder error.
+#   * Verifies the working tree is clean and dev is in sync with origin.
+#   * Loads the PR body from .io.v4rian.how-git/docs/CHANGELOG.md
+#     Unreleased section. Falls back to the PULL_REQUEST_TEMPLATE
+#     skeleton when the section is empty or missing. Inline body
+#     override flags also work.
+#   * Runs the advisory admin permission check.
+#   * Dispatches gh pr create with base main and head dev.
+#   * Reports the PR URL plus a note about the validate-pr-open
+#     amendment cycle that follows.
+#
+# Usage:
+#   init-release                          open the release PR with CHANGELOG Unreleased as body
+#   init-release --edit                   open $EDITOR with the pre-filled body
+#   init-release --title "..."            override the placeholder title
+#   init-release --body "..."             inline body (skips CHANGELOG)
+#   init-release --body-file path         body from file (skips CHANGELOG)
+#   init-release --repo OWNER/REPO        override target repo
+#   init-release --dry-run                show what would dispatch; no API
+#   init-release -h | --help              print this help
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Locate paths regardless of cwd
+# ---------------------------------------------------------------------------
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+NS_DIR=$(dirname "$SCRIPT_DIR")
+REPO_ROOT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X init-release: not inside a git repo" >&2
+  exit 2
+fi
+
+# shellcheck source=../scripts/_lib.sh
+. "$NS_DIR/scripts/_lib.sh"
+
+# Off-grid mode does not use PRs — bin/ship is the authoritative release
+# path. Refuse here so an admin does not accidentally open a release PR
+# against a remote the repo no longer considers authoritative.
+MODE_VAL=$(get_mode)
+if [ "$MODE_VAL" = "off-grid" ]; then
+  echo "X init-release: repo is in off-grid mode; PRs are not the release path." >&2
+  echo "  Off-grid release runs locally:" >&2
+  echo "    bin/ship   # switches to main, merges dev --no-ff, claims, optionally pushes" >&2
+  echo "  Or flip back to connected first: bin/set-mode connected" >&2
+  exit 2
+fi
+
+CHANGELOG_FILE="$NS_DIR/docs/CHANGELOG.md"
+TEMPLATE_FILE="$REPO_ROOT/.github/PULL_REQUEST_TEMPLATE.md"
+
+# ---------------------------------------------------------------------------
+# Flags
+# ---------------------------------------------------------------------------
+EDIT=false
+TITLE_OVERRIDE=""
+BODY_OVERRIDE=""
+BODY_FILE=""
+REPO=""
+DRY_RUN=false
+
+usage() { sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --edit)        EDIT=true; shift ;;
+    --title)       TITLE_OVERRIDE="$2"; shift 2 ;;
+    --body)        BODY_OVERRIDE="$2"; shift 2 ;;
+    --body-file)   BODY_FILE="$2"; shift 2 ;;
+    --repo)        REPO="$2"; shift 2 ;;
+    --dry-run)     DRY_RUN=true; shift ;;
+    -h|--help)     usage 0 ;;
+    *) echo "X unknown flag: $1" >&2; usage 2 ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Branch + tree validation
+# ---------------------------------------------------------------------------
+HEAD=$(git -C "$REPO_ROOT" rev-parse --abbrev-ref HEAD)
+if [ "$HEAD" != "dev" ]; then
+  echo "X init-release: current branch '$HEAD' is not dev. Only dev opens release PRs into main." >&2
+  echo "  Check out dev (git checkout dev), pull, then re-run." >&2
+  exit 2
+fi
+
+if ! git -C "$REPO_ROOT" diff --quiet || ! git -C "$REPO_ROOT" diff --cached --quiet; then
+  echo "X init-release: working tree is dirty. Commit, stash, or clean before opening the release PR." >&2
+  exit 2
+fi
+
+LOCAL_SHA=$(git -C "$REPO_ROOT" rev-parse HEAD)
+REMOTE_SHA=$(git -C "$REPO_ROOT" rev-parse origin/dev 2>/dev/null || echo "")
+if [ -z "$REMOTE_SHA" ]; then
+  echo "X init-release: origin/dev not found. Push dev first." >&2
+  exit 2
+fi
+if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
+  echo "X init-release: local dev ($LOCAL_SHA) differs from origin/dev ($REMOTE_SHA). Pull and re-run." >&2
+  exit 2
+fi
+
+if [ -z "$REPO" ]; then
+  ORIGIN_URL=$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null || true)
+  if [ -z "$ORIGIN_URL" ]; then
+    echo "X init-release: --repo not supplied and origin remote is not set" >&2
+    exit 2
+  fi
+  REPO=$(echo "$ORIGIN_URL" | sed -E 's|^https?://[^/]+/||; s|^git@[^:]+:||; s|\.git$||')
+fi
+
+# ---------------------------------------------------------------------------
+# gh CLI required
+# ---------------------------------------------------------------------------
+if ! command -v gh >/dev/null 2>&1; then
+  echo "X init-release: gh CLI is required (install: brew install gh on macOS, sudo apt install gh on Debian/Ubuntu)" >&2
+  exit 3
+fi
+
+TOKEN="${GH_TOKEN:-${CREATE_POOL_BRANCH_TOKEN:-}}"
+if [ -z "$TOKEN" ]; then
+  TOKEN=$(gh auth token 2>/dev/null || true)
+fi
+if [ -z "$TOKEN" ]; then
+  echo "X init-release: no GitHub token available (set GH_TOKEN, CREATE_POOL_BRANCH_TOKEN, or run 'gh auth login')" >&2
+  exit 3
+fi
+
+# ---------------------------------------------------------------------------
+# Advisory admin permission check
+# ---------------------------------------------------------------------------
+ACTOR=$(GH_TOKEN="$TOKEN" gh api user --jq '.login' 2>/dev/null || true)
+if [ -n "$ACTOR" ]; then
+  PERM=$(GH_TOKEN="$TOKEN" gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq '.permission' 2>/dev/null || echo "unknown")
+  if [ "$PERM" != "admin" ]; then
+    echo "X init-release: actor '${ACTOR}' has permission '${PERM}' on ${REPO} (admin required)" >&2
+    echo "  The validate-pr-open workflow re-checks this server side. Ask a repo admin to open the release PR." >&2
+    exit 4
+  fi
+  echo "  ok actor=${ACTOR} permission=admin on ${REPO}"
+fi
+
+# ---------------------------------------------------------------------------
+# Extract the CHANGELOG ## Unreleased section as the PR body skeleton.
+#
+# Falls back to the PULL_REQUEST_TEMPLATE skeleton (then to empty) when
+# the Unreleased section is missing or contains no prose.
+# ---------------------------------------------------------------------------
+extract_unreleased() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  awk '
+    /^##[[:space:]]+Unreleased[[:space:]]*$/ { capture = 1; next }
+    capture && /^##[[:space:]]/ { exit }
+    capture { print }
+  ' "$f"
+}
+
+WORK=$(mktemp -d -t init-release-XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+BODY_PATH="$WORK/body.md"
+
+if [ -n "$BODY_OVERRIDE" ]; then
+  printf '%s\n' "$BODY_OVERRIDE" > "$BODY_PATH"
+elif [ -n "$BODY_FILE" ]; then
+  if [ ! -f "$BODY_FILE" ]; then
+    echo "X --body-file '$BODY_FILE' not found" >&2
+    exit 2
+  fi
+  cp "$BODY_FILE" "$BODY_PATH"
+else
+  UNRELEASED=""
+  if [ -f "$CHANGELOG_FILE" ]; then
+    UNRELEASED=$(extract_unreleased "$CHANGELOG_FILE")
+  fi
+  # Trim leading + trailing whitespace; if empty, fall through to template.
+  UNRELEASED_TRIMMED=$(printf '%s' "$UNRELEASED" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+  if [ -n "$UNRELEASED_TRIMMED" ]; then
+    printf '## Summary\n\n%s\n' "$UNRELEASED_TRIMMED" > "$BODY_PATH"
+    echo "  ok pre-filled body from CHANGELOG Unreleased section ($(wc -c < "$BODY_PATH" | tr -d ' ') chars)"
+  elif [ -f "$TEMPLATE_FILE" ]; then
+    cp "$TEMPLATE_FILE" "$BODY_PATH"
+    echo "  · CHANGELOG Unreleased section is empty; falling back to PULL_REQUEST_TEMPLATE skeleton"
+  else
+    : > "$BODY_PATH"
+    echo "  · no CHANGELOG Unreleased and no PR template; opening with empty body (workflow will amend)"
+  fi
+fi
+
+if $EDIT; then
+  : "${EDITOR:=vi}"
+  "$EDITOR" "$BODY_PATH"
+fi
+
+# Placeholder title; validator amends to [MERGE] dev into main: vYYYY.X.Y.
+if [ -n "$TITLE_OVERRIDE" ]; then
+  TITLE="$TITLE_OVERRIDE"
+else
+  TITLE="[MERGE] dev into main: pending validate-pr-open amendment"
+fi
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+if $DRY_RUN; then
+  echo "[dry-run] target repo: $REPO"
+  echo "[dry-run] head:        dev"
+  echo "[dry-run] base:        main"
+  echo "[dry-run] title:       $TITLE"
+  echo "[dry-run] body chars:  $(wc -c < "$BODY_PATH" | tr -d ' ')"
+  echo "[dry-run] would call:  gh pr create --repo $REPO --base main --head dev --title ... --body-file ..."
+  exit 0
+fi
+
+URL=$(GH_TOKEN="$TOKEN" gh pr create \
+  --repo "$REPO" \
+  --base main \
+  --head dev \
+  --title "$TITLE" \
+  --body-file "$BODY_PATH" 2>&1) || {
+  rc=$?
+  echo "X gh pr create failed (rc=$rc):" >&2
+  echo "$URL" >&2
+  exit "$rc"
+}
+
+echo
+echo "ok created dev to main release PR"
+echo "$URL"
+echo
+echo "  the validate-pr-open workflow will amend the title to [MERGE] dev into main: vYYYY.X.Y"
+echo "  derived from bin/version --release-tag, run the auto-fix pass over the body, embed"
+echo "  the opened-via-correct-flow signature, and post the required status check. Merge"
+echo "  manually once every required status check is green."

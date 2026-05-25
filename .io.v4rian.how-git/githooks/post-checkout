@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# post-checkout — branch-name warning + invoke the in-repo
+# git-snapshot-preflight Claude skill so the preflight backup runs as
+# a side effect of every working-branch checkout.
+#
+# Skipped on file-checkouts ($3 != 1) and on protected branches
+# (main, dev) where preflight isn't applicable.
+
+prev=$1; new=$2; is_branch_checkout=$3
+[[ "$is_branch_checkout" == "1" ]] || exit 0
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+[[ "$branch" =~ ^(main|dev)$ ]] && exit 0
+
+pattern='^(pool|safety)/n[0-9]+\.(feature|fix|r&d|refactor|reconcile|doc)\.(sprint[0-9]+-)?([A-Z]+-[0-9]+-)?[a-z0-9][a-z0-9-]*$'
+
+if [[ ! "$branch" =~ $pattern ]]; then
+  echo "⚠  Branch '$branch' doesn't match the v4rian format."
+  echo "   Expected: (pool|safety)/nN.(feature|fix|r&d|refactor|reconcile|doc).[sprintX-][JIRA-]short_name"
+  echo "   This is OK for local spikes; the remote will reject it on push."
+  # Still fall through to preflight — the skill can decide what to do for spikes.
+fi
+
+# Source shared helpers (claude_skill_run)
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+[ -z "$REPO_ROOT" ] && exit 0
+. "$REPO_ROOT/.io.v4rian.how-git/scripts/_lib.sh"
+
+# Fetch the active-requirement for this branch so the preflight skill
+# can include the canonical intent in its prompt. Empty when the branch
+# predates this lifecycle step or was allocated without a requirement.
+ACTIVE_REQUIREMENT=""
+if [ -x "$REPO_ROOT/.io.v4rian.how-git/scripts/get-active-requirement.sh" ]; then
+  ACTIVE_REQUIREMENT=$(bash "$REPO_ROOT/.io.v4rian.how-git/scripts/get-active-requirement.sh" HEAD 2>/dev/null || true)
+fi
+REQ_HEADER=""
+if [ -n "$ACTIVE_REQUIREMENT" ]; then
+  REQ_HEADER="Active requirement for $branch (canonical intent stamped by the allocator at branch-out time): ${ACTIVE_REQUIREMENT}. "
+fi
+
+# Run preflight via the in-repo git-snapshot-preflight skill.
+# Note: we don't propagate failure here — a half-checked-out state
+# from a blocked post-checkout is worse than missing a preflight. The
+# skill should warn loudly but not block the checkout itself.
+claude_skill_run git-snapshot-preflight "${REQ_HEADER}post-checkout firing on branch=$branch (prev=$prev new=$new); make sure the safety/ anchor and offsite backup exist before any work begins" || true

@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# finalize-pool-merge — off-grid CLI to drive the local pool/* → dev close-up.
+#
+# In off-grid mode there is no remote workflow racing the operator to claim
+# the dev tip, so the close-up runs locally. The admin merges a pool/* into
+# dev manually (git checkout dev && git merge --no-ff pool/nN.kind.short),
+# then runs this script to amend the merge subject to the [MERGE] spec form,
+# tag the new dev tip with vYYYY.SERIES.DEV, vault the pool branch into
+# vault/, and push everything to whichever origin is currently bound (which
+# may be a LAN mirror, an air-gapped USB drive remote, or no remote at all).
+#
+# This script REFUSES to run in connected mode. In connected mode the close-up
+# is driven by the claim-on-merge-dev workflow when the PR merges via the
+# GitHub UI — running this locally would race the workflow and risk producing
+# duplicate tags on the same SHA. Flip the repo to off-grid first with
+# bin/set-mode off-grid if you really need to run a local-only close-up.
+#
+# Behavior in order:
+#
+#   1. Verify the repo is in off-grid mode (MODE file = off-grid). Refuse
+#      with a clear error if connected — including the exact bin/set-mode
+#      command to flip mode if that's the intent.
+#   2. Verify the operator is an admin on the repo. In off-grid mode there's
+#      no remote-side enforcement, so the local advisory check is the only
+#      gate. Refuse if the local git user.email doesn't match an admin
+#      identity in .io.v4rian.how-git/admins.txt (one email per line).
+#      Falls through with a warning if admins.txt is absent (off-grid setup
+#      is intentionally permissive on the first run).
+#   3. Verify HEAD is on dev, the working tree is clean, and HEAD is a
+#      merge commit (>=2 parents). Refuse otherwise — the operator must
+#      run the merge themselves before invoking this script.
+#   4. Verify the second-parent's tip is a pool/* branch. Extract the pool
+#      branch name from the local refs (git for-each-ref --contains).
+#   5. Invoke claim-dev-merge.sh, which now lifts its CI gate in off-grid
+#      mode. The claim script does the amend, tag, vault, and push.
+#
+# Usage:
+#   finalize-pool-merge                  do the full close-up
+#   finalize-pool-merge --dry-run        show what claim-dev-merge would do, no mutations
+#   finalize-pool-merge --skip-pull      skip `git pull origin dev` (LAN remote may not be reachable)
+#   finalize-pool-merge -h | --help      print this help
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Locate the script + namespace + repo regardless of cwd
+# ---------------------------------------------------------------------------
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+NS_DIR=$(dirname "$SCRIPT_DIR")
+REPO_ROOT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X finalize-pool-merge: not inside a git repo" >&2
+  exit 2
+fi
+
+# shellcheck source=../scripts/_lib.sh
+. "$NS_DIR/scripts/_lib.sh"
+
+DRY_RUN=false
+SKIP_PULL=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run)   DRY_RUN=true; shift ;;
+    --skip-pull) SKIP_PULL=true; shift ;;
+    -h|--help)   sed -n '2,42p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "X unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+cd "$REPO_ROOT"
+
+# ---------------------------------------------------------------------------
+# Step 1 — refuse in connected mode
+# ---------------------------------------------------------------------------
+MODE_VAL=$(get_mode)
+if [ "$MODE_VAL" != "off-grid" ]; then
+  echo "X finalize-pool-merge: repo is in '$MODE_VAL' mode; off-grid is required." >&2
+  echo "  In connected mode the close-up runs from the claim-on-merge-dev workflow when the PR" >&2
+  echo "  merges via the GitHub UI. Running this locally would race the workflow." >&2
+  echo "  If you really need a local-only close-up, flip mode first:" >&2
+  echo "    bin/set-mode off-grid" >&2
+  exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Step 2 — admin identity gate
+# ---------------------------------------------------------------------------
+ADMINS_FILE="$NS_DIR/admins.txt"
+LOCAL_EMAIL=$(git config --get user.email 2>/dev/null || echo "")
+if [ -f "$ADMINS_FILE" ]; then
+  if [ -z "$LOCAL_EMAIL" ]; then
+    echo "X finalize-pool-merge: git user.email is not set; off-grid admin check needs it" >&2
+    exit 2
+  fi
+  if ! grep -Fxq "$LOCAL_EMAIL" "$ADMINS_FILE"; then
+    echo "X finalize-pool-merge: '$LOCAL_EMAIL' is not listed in $ADMINS_FILE" >&2
+    echo "  Off-grid claim ceremonies are admin-only by design. Ask a listed admin to run it," >&2
+    echo "  or add yourself to admins.txt via a normal pool/* PR if you should be an admin." >&2
+    exit 4
+  fi
+  echo "→ off-grid admin check: $LOCAL_EMAIL listed in admins.txt"
+else
+  echo "  ! $ADMINS_FILE not present; skipping admin identity check (off-grid first-run bootstrap)"
+fi
+
+# ---------------------------------------------------------------------------
+# Step 3 — HEAD shape + cleanliness
+# ---------------------------------------------------------------------------
+HEAD_REF=$(git rev-parse --abbrev-ref HEAD)
+if [ "$HEAD_REF" != "dev" ]; then
+  echo "X finalize-pool-merge: HEAD is '$HEAD_REF', not 'dev'. Switch to dev first." >&2
+  exit 2
+fi
+
+if [ -n "$(git status --porcelain)" ]; then
+  echo "X finalize-pool-merge: working tree dirty - commit or stash before claiming" >&2
+  git status --short >&2
+  exit 2
+fi
+
+PARENT_COUNT=$(git rev-list --parents -n 1 HEAD | wc -w | tr -d ' ')
+if [ "$PARENT_COUNT" -lt 3 ]; then
+  echo "X finalize-pool-merge: HEAD has $((PARENT_COUNT - 1)) parents; need >=2 (the pool->dev merge commit)." >&2
+  echo "  Run the merge first: git merge --no-ff pool/nN.kind.short-name -m 'merge body'" >&2
+  exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Step 4 — second-parent must trace to a pool/* branch
+# ---------------------------------------------------------------------------
+SECOND_PARENT=$(git rev-parse HEAD^2 2>/dev/null || echo "")
+if [ -z "$SECOND_PARENT" ]; then
+  echo "X finalize-pool-merge: cannot resolve second parent of HEAD" >&2
+  exit 2
+fi
+
+POOL_BRANCH=$(git for-each-ref --format='%(refname:short)' "refs/heads/pool/*" \
+  | while IFS= read -r br; do
+      [ "$(git rev-parse "$br")" = "$SECOND_PARENT" ] && echo "$br"
+    done | head -1)
+
+if [ -z "$POOL_BRANCH" ]; then
+  echo "X finalize-pool-merge: second parent ($SECOND_PARENT) does not match any pool/* branch tip" >&2
+  echo "  The merge may have already been pruned (vault) or the pool was advanced after the merge." >&2
+  echo "  Inspect: git for-each-ref refs/heads/pool/" >&2
+  exit 2
+fi
+
+echo "→ pool branch resolved: $POOL_BRANCH (tip = $SECOND_PARENT)"
+
+# ---------------------------------------------------------------------------
+# Step 5 — invoke claim-dev-merge.sh; it now lifts its CI gate in off-grid mode
+# ---------------------------------------------------------------------------
+CLAIM_SCRIPT="$NS_DIR/scripts/claim-dev-merge.sh"
+if [ ! -x "$CLAIM_SCRIPT" ]; then
+  echo "X finalize-pool-merge: claim script missing or not executable at $CLAIM_SCRIPT" >&2
+  exit 1
+fi
+
+ARGS=()
+$DRY_RUN && ARGS+=(--dry-run)
+$SKIP_PULL && ARGS+=(--skip-pull)
+
+echo "→ invoking $CLAIM_SCRIPT ${ARGS[*]:-}"
+"$CLAIM_SCRIPT" "${ARGS[@]}"

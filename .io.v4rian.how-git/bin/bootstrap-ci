@@ -1,0 +1,895 @@
+#!/usr/bin/env bash
+# bootstrap-ci - one shot CI setup for a freshly templated v4rian repo.
+#
+# GitHub's "Use this template" button copies the on-disk files (workflows,
+# scripts, hooks, docs) but does NOT copy any repo-level settings: branch
+# protection, Repository Rules, required status check bindings, secrets,
+# or Actions enablement. This tool runs in the new repo to apply
+# everything that does not come for free.
+#
+# Idempotent. Safe to re-run. Each step probes current state and only
+# mutates when drift is detected. Use --check for a read-only audit and
+# --dry-run to print every API call without executing.
+#
+# Steps (in order):
+#   1. Verify Actions is enabled on the repo
+#  1b. Per-workflow enable state: every shipped workflow under
+#      .github/workflows/ that is registered as disabled_manually or
+#      disabled_inactivity on the repo gets re-enabled via the workflows
+#      API. Workflows that exist on disk but have not had a trigger fire
+#      yet are not yet in the registry; they auto-register on first run.
+#   2. Verify dev branch exists on origin (auto-seed at main's SHA if missing)
+#   3. Apply branch protection on main + dev (delegates to apply-repo-rules.sh)
+#   4. Apply Repository Rules: pool-creations, safety-lockdown, vault-readonly
+#      (also delegates to apply-repo-rules.sh)
+#   5. Bind required status checks on PRs into dev. The set is the union
+#      of 'opened-via-correct-flow' (hardcoded, posted by validate-pr-open.yml
+#      which does more than emit a check) and every required.*.sh basename
+#      discovered under ci/{tests,audits}/push/ across both the usr
+#      layer (ci/ at repo root) and the sys layer (.io.v4rian.how-git/ci/).
+#      Each required.* file's basename minus the .sh becomes the bound
+#      context name so the dispatcher's posted check matches the binding.
+#      The audits run on push to the head SHA; the PR reuses the result
+#      by context name (no re-run on pr-open).
+#   6. Set merge-commit defaults: merge subject inherits the PR title (which
+#      carries the vYYYY.X.Y version stamp) and merge body inherits the PR
+#      body (which IS the macro-tone TLDR of the change)
+#   7. Lock merge mode to --no-ff merge commits only (disable squash + rebase)
+#      so the v4rian model's commit shape is enforced at repo level
+#   8. Disable "auto-delete merged branches" so the claim flow can archive
+#      every merged pool branch to its paired vault/ ref intact
+#   9. Set repo topics for v4rian identification (topics: v4rian, how-git)
+#  9b. Consumer cleanup: on a consumer repo (FRAMEWORK_REPO marker absent),
+#      keep .io.v4rian.how-git/framework-tests/ as the on-demand diagnostic suite for
+#      bin/doctor --deep, remove .github/workflows/framework-self-tests.yml
+#      (auto-firing workflow, no consumer purpose), and replace root
+#      README.md with a consumer stub only when it still md5-matches the
+#      framework's README (consumer has not edited it). On the framework
+#      source repo (marker present), this step is a no-op.
+#  10. Report final state and any operator-only follow-ups (App IDs, secrets)
+#
+# Dependency policy:
+#   REQUIRED: bash, git, curl, python3   (preinstalled on macOS + most Linux)
+#   OPTIONAL: gh CLI                      (used only as a token source if present)
+#
+# Auth token resolution order (mirrors open-pr.sh):
+#   1. $GH_TOKEN
+#   2. $CREATE_POOL_BRANCH_TOKEN
+#   3. gh auth token (if gh is installed)
+#   4. ~/.gcm/store/git/https/github.com/<account>.credential (first line)
+#
+# Operator-only inputs (surfaced if absent; the tool does not invent them):
+#   ALLOCATOR_APP_ID         GitHub integration id the allocator + claim workflows run as
+#                             (usually the repo's github-actions bot installation id)
+#   CI_BOT_APP_ID            GitHub App id of the CI bot (often the same id)
+#
+# Usage:
+#   bootstrap-ci                run every step; idempotent
+#   bootstrap-ci --check        report what is set up vs what is missing; no mutations
+#   bootstrap-ci --dry-run      print every API call that would be made; no mutations
+#   bootstrap-ci -h | --help    print this help
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Locate the repo root and the namespace dir relative to this script
+# ----------------------------------------------------------------------------
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+NS_DIR_FULL=$(dirname "$SCRIPT_DIR")
+NS_DIR=$(basename "$NS_DIR_FULL")    # e.g. .io.v4rian.how-git
+REPO_ROOT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X bootstrap-ci: not inside a git repo" >&2
+  exit 2
+fi
+
+# shellcheck source=../scripts/_lib.sh
+. "$NS_DIR_FULL/scripts/_lib.sh"
+
+# Off-grid repos do not run bootstrap-ci. The whole purpose of this tool
+# is to wire up GitHub-side state (branch protection, Repository Rules,
+# required status checks, merge defaults) that has no meaning when the
+# remote is not the authoritative source of truth.
+REPO_MODE_VAL=$(get_mode 2>/dev/null || echo "connected")
+if [ "$REPO_MODE_VAL" = "off-grid" ]; then
+  echo "X bootstrap-ci: repo is in off-grid mode; GitHub-side CI bootstrap does not apply." >&2
+  echo "  Off-grid governance lives in admins.txt plus local hooks; remote CI setup is inert." >&2
+  echo "  Flip back to connected first if this repo is rejoining a GitHub remote:" >&2
+  echo "    bin/set-mode connected" >&2
+  exit 2
+fi
+
+# ----------------------------------------------------------------------------
+# Parse flags
+# ----------------------------------------------------------------------------
+MODE="apply"   # apply | check | dry-run
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --check)    MODE="check"; shift ;;
+    --dry-run)  MODE="dry-run"; shift ;;
+    -h|--help)  sed -n '2,58p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "X unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+# ----------------------------------------------------------------------------
+# Logging helpers (match open-pr.sh tone)
+# ----------------------------------------------------------------------------
+ok()   { printf "  ok   %s\n" "$1"; }
+miss() { printf "  miss %s - %s\n" "$1" "$2"; }
+skip() { printf "  skip %s - %s\n" "$1" "$2"; }
+note() { printf "  .    %s\n" "$1"; }
+hdr()  { printf "\n-> %s\n" "$1"; }
+
+# ----------------------------------------------------------------------------
+# Token resolution (mirrors open-pr.sh)
+# ----------------------------------------------------------------------------
+resolve_token() {
+  if [ -n "${GH_TOKEN:-}" ]; then
+    printf '%s' "$GH_TOKEN"; return 0
+  fi
+  if [ -n "${CREATE_POOL_BRANCH_TOKEN:-}" ]; then
+    printf '%s' "$CREATE_POOL_BRANCH_TOKEN"; return 0
+  fi
+  if command -v gh >/dev/null 2>&1; then
+    local t
+    t=$(gh auth token 2>/dev/null || true)
+    if [ -n "$t" ]; then printf '%s' "$t"; return 0; fi
+  fi
+  local gcm_dir="$HOME/.gcm/store/git/https/github.com"
+  if [ -d "$gcm_dir" ]; then
+    local f
+    for f in "$gcm_dir"/*.credential; do
+      [ -f "$f" ] || continue
+      local t
+      t=$(head -1 "$f" 2>/dev/null || true)
+      if [ -n "$t" ]; then printf '%s' "$t"; return 0; fi
+    done
+  fi
+  return 3
+}
+
+# ----------------------------------------------------------------------------
+# Derive owner/repo from origin remote (mirrors open-pr.sh)
+# ----------------------------------------------------------------------------
+derive_owner_repo() {
+  local url
+  url=$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null || true)
+  if [ -z "$url" ]; then
+    echo "X origin remote not configured" >&2
+    return 2
+  fi
+  echo "$url" | sed -E 's|^https?://[^/]+/||; s|^git@[^:]+:||; s|\.git$||'
+}
+
+# ----------------------------------------------------------------------------
+# Thin curl wrapper that respects the mode (check / dry-run / apply)
+# ----------------------------------------------------------------------------
+api_call() {
+  local method="$1" path="$2" body="${3:-}"
+  local url="https://api.github.com/$path"
+  if [ "$MODE" = "dry-run" ]; then
+    if [ -n "$body" ]; then
+      printf '  [dry-run] %s %s\n            body: %s\n' "$method" "$url" "$body"
+    else
+      printf '  [dry-run] %s %s\n' "$method" "$url"
+    fi
+    return 0
+  fi
+  if [ -n "$body" ]; then
+    curl -sS -X "$method" \
+      -H "Authorization: token $TOKEN" \
+      -H "Accept: application/vnd.github+json" \
+      -H "Content-Type: application/json" \
+      -d "$body" \
+      "$url"
+  else
+    curl -sS -X "$method" \
+      -H "Authorization: token $TOKEN" \
+      -H "Accept: application/vnd.github+json" \
+      "$url"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Step 1: verify Actions is enabled on the repo
+# ----------------------------------------------------------------------------
+step_actions_enabled() {
+  hdr "step 1: Actions enabled"
+  local resp enabled
+  resp=$(curl -sS \
+    -H "Authorization: token $TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/$OWNER_REPO/actions/permissions" 2>/dev/null || true)
+  enabled=$(printf '%s' "$resp" | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(str(d.get('enabled','')).lower())
+except Exception:
+    print('error')" 2>/dev/null || echo error)
+  case "$enabled" in
+    true) ok "Actions enabled for $OWNER_REPO" ;;
+    false)
+      miss "Actions" "currently DISABLED on $OWNER_REPO"
+      note "operator step: GitHub web UI -> Settings -> Actions -> General -> 'Allow all actions and reusable workflows'"
+      ;;
+    error|*)
+      miss "Actions" "could not read actions permissions (token may lack 'administration' scope)"
+      ;;
+  esac
+}
+
+# ----------------------------------------------------------------------------
+# Step 1b: every shipped workflow is in the active state
+# Workflows registered on the repo can sit in disabled_manually (an operator
+# clicked Disable in the UI, or a previous misconfig left them off) and a
+# disabled workflow does not fire on its triggers. The whole v4rian claim
+# ceremony depends on claim-on-merge-dev and claim-on-merge-main firing on
+# push to dev and main, so a disabled state silently breaks the model. This
+# step lists every workflow file shipped under .github/workflows/, reads
+# its registered state via the workflows API, and enables any that are
+# disabled_manually. Workflows that exist on disk but have never fired
+# yet (and thus are not in the registry) are no-ops here — they auto-
+# register on first trigger and arrive in the active state.
+# ----------------------------------------------------------------------------
+step_workflows_enabled() {
+  hdr "step 1b: per-workflow enable state"
+  local wf_dir registered
+  wf_dir="$REPO_ROOT/.github/workflows"
+  if [ ! -d "$wf_dir" ]; then
+    note "no .github/workflows dir on disk; nothing to enable"
+    return 0
+  fi
+  registered=$(curl -sS \
+    -H "Authorization: token $TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/$OWNER_REPO/actions/workflows?per_page=100" 2>/dev/null || true)
+  if [ -z "$registered" ]; then
+    miss "workflows" "could not read /actions/workflows from the API"
+    return 0
+  fi
+  local file basename state
+  for file in "$wf_dir"/*.yml "$wf_dir"/*.yaml; do
+    [ -f "$file" ] || continue
+    basename=$(basename "$file")
+    state=$(printf '%s' "$registered" | WF_NAME="$basename" python3 -c "import json,sys,os
+name=os.environ['WF_NAME']
+try:
+    d=json.load(sys.stdin)
+    for w in d.get('workflows',[]):
+        p=w.get('path','')
+        if p.endswith('/'+name) or p == name:
+            print(w.get('state',''))
+            sys.exit(0)
+    print('not_registered')
+except Exception:
+    print('error')" 2>/dev/null || echo error)
+    case "$state" in
+      active)
+        ok "$basename active"
+        ;;
+      disabled_manually|disabled_inactivity)
+        if [ "$MODE" = "check" ]; then
+          miss "$basename" "registered but state=$state (would enable)"
+        elif [ "$MODE" = "dry-run" ]; then
+          note "[dry-run] PUT /repos/$OWNER_REPO/actions/workflows/$basename/enable"
+        else
+          local rc
+          rc=$(curl -sS -o /dev/null -w "%{http_code}" -X PUT \
+            -H "Authorization: token $TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$OWNER_REPO/actions/workflows/$basename/enable" 2>/dev/null || echo 000)
+          case "$rc" in
+            204) ok "$basename re-enabled (was $state)" ;;
+            *)   miss "$basename" "enable returned HTTP $rc" ;;
+          esac
+        fi
+        ;;
+      not_registered)
+        note "$basename not registered yet (no trigger has fired; auto-registers on first run)"
+        ;;
+      error|"")
+        miss "$basename" "could not read state from API response"
+        ;;
+      *)
+        note "$basename state=$state (no action)"
+        ;;
+    esac
+  done
+}
+
+# ----------------------------------------------------------------------------
+# Step 2: verify dev branch exists; seed from main if missing
+# ----------------------------------------------------------------------------
+step_seed_dev() {
+  hdr "step 2: dev branch exists on origin"
+  local resp dev_sha main_sha
+  resp=$(curl -sS \
+    -H "Authorization: token $TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/$OWNER_REPO/branches/dev" 2>/dev/null || true)
+  dev_sha=$(printf '%s' "$resp" | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(d.get('commit',{}).get('sha',''))
+except Exception:
+    print('')" 2>/dev/null || true)
+  if [ -n "$dev_sha" ]; then
+    ok "dev exists at $dev_sha"
+    return 0
+  fi
+
+  if [ "$MODE" = "check" ]; then
+    miss "dev" "branch absent on origin"
+    return 0
+  fi
+
+  # Read main's SHA to seed dev at the same commit
+  resp=$(curl -sS \
+    -H "Authorization: token $TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/$OWNER_REPO/branches/main" 2>/dev/null || true)
+  main_sha=$(printf '%s' "$resp" | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(d.get('commit',{}).get('sha',''))
+except Exception:
+    print('')" 2>/dev/null || true)
+  if [ -z "$main_sha" ]; then
+    miss "dev" "could not read main's SHA to seed from"
+    return 1
+  fi
+  local body
+  body=$(SHA="$main_sha" python3 -c "import json,os; print(json.dumps({'ref':'refs/heads/dev','sha':os.environ['SHA']}))")
+  api_call POST "repos/$OWNER_REPO/git/refs" "$body" >/dev/null
+  ok "dev seeded at $main_sha (matches main)"
+}
+
+# ----------------------------------------------------------------------------
+# Step 3 + 4: apply branch protection + Repository Rules via apply-repo-rules.sh
+# Both delegate to the same script; the script handles main + dev protection
+# AND the three ruleset POSTs (pool-creations, safety-lockdown, vault-readonly).
+# ----------------------------------------------------------------------------
+step_apply_rules() {
+  hdr "step 3+4: branch protection + Repository Rules"
+  local apply="$REPO_ROOT/$NS_DIR/scripts/apply-repo-rules.sh"
+  if [ ! -x "$apply" ]; then
+    miss "apply-repo-rules.sh" "not present or not executable at $apply"
+    return 1
+  fi
+
+  # Operator-supplied App IDs gate the ruleset POSTs. Surface clearly when missing.
+  # ALLOCATOR_APP_ID is the new canonical name; BRANCH_CREATOR_APP_ID stays
+  # accepted as a backward compatible fallback for operator shells that
+  # still export the old name.
+  local app_id="${ALLOCATOR_APP_ID:-${BRANCH_CREATOR_APP_ID:-}}"
+  if [ -z "$app_id" ] || [ "$app_id" = "CHANGEME" ]; then
+    miss "ALLOCATOR_APP_ID" "operator must set this env var to the allocator workflow's integration id before rulesets can be applied"
+    note "lookup: gh api /orgs/<org>/installations --jq '.installations[] | select(.app_slug==\"github-actions\") | .id'"
+    return 0
+  fi
+  if [ -z "${CI_BOT_APP_ID:-}" ] || [ "${CI_BOT_APP_ID:-CHANGEME}" = "CHANGEME" ]; then
+    miss "CI_BOT_APP_ID" "operator must set this env var to the CI bot integration id (commonly the same as ALLOCATOR_APP_ID)"
+    return 0
+  fi
+
+  if [ "$MODE" = "check" ]; then
+    note "would invoke apply-repo-rules.sh against $OWNER_REPO (skipping in check mode)"
+    return 0
+  fi
+  if [ "$MODE" = "dry-run" ]; then
+    printf '  [dry-run] %s with ORG=%s REPO=%s ALLOCATOR_APP_ID=%s CI_BOT_APP_ID=%s\n' \
+      "$apply" "${OWNER_REPO%/*}" "${OWNER_REPO#*/}" "$app_id" "$CI_BOT_APP_ID"
+    return 0
+  fi
+
+  ORG="${OWNER_REPO%/*}" \
+  REPO="${OWNER_REPO#*/}" \
+  ALLOCATOR_APP_ID="$app_id" \
+  CI_BOT_APP_ID="$CI_BOT_APP_ID" \
+  bash "$apply"
+}
+
+# ----------------------------------------------------------------------------
+# Step 5: bind required status checks on PRs to dev.
+#
+# Two sources feed the dev binding:
+#
+#   1. 'opened-via-correct-flow' — hardcoded. Posted by validate-pr-open.yml
+#     which amends PR title + body in addition to emitting the check, so it
+#     has no required.*.sh file under ci/ and is not picked up by the
+#     discovery walk below.
+#
+#   2. Discovered from required.*.sh under ci/{tests,audits}/push/ across
+#     both layers (usr: ci/ at repo root; sys: .io.v4rian.how-git/ci/). Each
+#     script's basename minus the .sh becomes the bound context name.
+#     ci-dispatch.yml's push matrix posts the check under that same name.
+#     The pr-open event does NOT re-run these audits — the PR reuses the
+#     latest push-validation result for the head SHA, since branch
+#     protection looks up status checks by context name regardless of which
+#     event published them.
+#
+# Main PRs are pre-validated by the dev->main release flow, so no required
+# checks are bound on main here.
+#
+# Branch protection PUT in apply-repo-rules.sh sets the same context set on
+# dev for defense in depth (idempotent on both paths).
+# ----------------------------------------------------------------------------
+step_required_checks() {
+  hdr "step 5: required status checks"
+  # The dev required-checks set is the union of:
+  #   1. Hardcoded entries that no script in ci/ owns: 'opened-via-correct-flow'
+  #      is posted by validate-pr-open.yml (which does more than emit a status
+  #      check — it amends PR title + body), so it has no required.* file.
+  #   2. Discovered entries from ci/{tests,audits}/push/required.*.sh
+  #      across BOTH the usr layer (ci/) and the sys layer
+  #      (.io.v4rian.how-git/ci/) — the dispatcher posts each script's basename
+  #      (minus .sh) as a status check, and the required.* naming convention
+  #      marks them as merge-blocking. The discovery walk is the single source
+  #      of truth for which checks merit the binding. These audits run on push
+  #      to the head SHA; the PR reuses the result by context name.
+  #
+  # The main required-checks set is 'doc-freshness' only: the dev → main
+  # release path is pre-validated by the dev claim flow + the release PR's
+  # own gate, so re-running the push-time audits on the dev → main hop
+  # adds zero signal. doc-freshness is the one exception — it inspects the
+  # dev → main substantive diff and asserts CHANGELOG / RUNBOOK / CONTRIBUTING
+  # / README cover the release, which is only meaningful at the release-PR
+  # moment. It fires from .github/workflows/doc-freshness.yml on every PR
+  # opened/edited/synchronize against main; binding it here means a release
+  # cannot land while the docs lag the diff.
+  local dev_checks=("opened-via-correct-flow")
+  local c
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    dev_checks+=("$c")
+  done < <(_discover_required_checks push)
+  local main_checks=("doc-freshness")
+  _bind_required_checks main "${main_checks[@]}"
+  _bind_required_checks dev "${dev_checks[@]}"
+}
+
+# Helper: walk ci/{tests,audits}/<trigger>/required.*.sh under both the usr
+# layer (ci/ at repo root, consumer owned) and the sys layer
+# (.io.v4rian.how-git/ci/, framework owned) and emit one line per discovered
+# script's check name (basename minus .sh). Names are deduplicated; the
+# scan is read-only so safe to invoke in --check + --dry-run modes.
+_discover_required_checks() {
+  local trigger="$1"
+  local layer kind dir f bn name
+  {
+    for layer in "ci" ".io.v4rian.how-git/ci"; do
+      for kind in tests audits; do
+        dir="$REPO_ROOT/$layer/$kind/$trigger"
+        [ -d "$dir" ] || continue
+        while IFS= read -r f; do
+          [ -f "$f" ] || continue
+          bn=$(basename "$f")
+          case "$bn" in
+            required.*.sh)
+              name="${bn%.sh}"
+              printf '%s\n' "$name"
+              ;;
+          esac
+        done < <(find "$dir" -maxdepth 1 -type f -name 'required.*.sh' 2>/dev/null | sort)
+      done
+    done
+  } | sort -u
+}
+
+# Helper: bind the supplied required-status-check contexts on the given
+# branch. Idempotent — probes current contexts via GET and only PATCHes
+# when at least one of the requested contexts is missing. Honors --check
+# (read-only report) and --dry-run (print API call without executing).
+_bind_required_checks() {
+  local branch="$1"; shift
+  local wanted=("$@")
+  local resp current
+  resp=$(curl -sS \
+    -H "Authorization: token $TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/$OWNER_REPO/branches/$branch/protection/required_status_checks" 2>/dev/null || true)
+  current=$(printf '%s' "$resp" | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    ctx=d.get('contexts',[])
+    print('\n'.join(ctx))
+except Exception:
+    print('')" 2>/dev/null || true)
+
+  local missing=()
+  local c
+  for c in "${wanted[@]}"; do
+    if printf '%s\n' "$current" | grep -Fxq "$c"; then
+      ok "$branch already requires '$c'"
+    else
+      missing+=("$c")
+    fi
+  done
+
+  if [ ${#missing[@]} -eq 0 ]; then
+    return 0
+  fi
+
+  if [ "$MODE" = "check" ]; then
+    for c in "${missing[@]}"; do
+      miss "$branch" "missing required check '$c'"
+    done
+    return 0
+  fi
+
+  # Append every missing context to whatever already exists, dedup + sort.
+  local merged body all
+  all=$(printf '%s\n' "$current" "${missing[@]}" | grep -v '^$')
+  merged=$(printf '%s\n' "$all" | sort -u | python3 -c "import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))")
+  body=$(CTX="$merged" python3 -c "import json,os; print(json.dumps({'strict':True,'contexts':json.loads(os.environ['CTX'])}))")
+  if [ "$MODE" = "dry-run" ]; then
+    api_call PATCH "repos/$OWNER_REPO/branches/$branch/protection/required_status_checks" "$body"
+  else
+    api_call PATCH "repos/$OWNER_REPO/branches/$branch/protection/required_status_checks" "$body" >/dev/null
+  fi
+  for c in "${missing[@]}"; do
+    ok "$branch now requires '$c'"
+  done
+}
+
+# ----------------------------------------------------------------------------
+# Step 6: merge-commit defaults.
+#
+# Subject inherits from the PR title (vYYYY.X.Y stamp carries through), and
+# body inherits from the PR body (the macro-tone TLDR). Without this,
+# GitHub's default is subject='MERGE_MESSAGE' and body='PR_TITLE', which
+# produces "Merge pull request #N from ..." merge subjects that lose the
+# version stamp completely.
+# ----------------------------------------------------------------------------
+step_merge_commit_defaults() {
+  hdr "step 6: merge-commit defaults (subject=PR_TITLE, body=PR_BODY)"
+  local resp title msg
+  resp=$(curl -sS \
+    -H "Authorization: token $TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/$OWNER_REPO" 2>/dev/null || true)
+  title=$(printf '%s' "$resp" | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(d.get('merge_commit_title',''))
+except Exception:
+    print('')" 2>/dev/null || true)
+  msg=$(printf '%s' "$resp" | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(d.get('merge_commit_message',''))
+except Exception:
+    print('')" 2>/dev/null || true)
+
+  if [ "$title" = "PR_TITLE" ] && [ "$msg" = "PR_BODY" ]; then
+    ok "merge_commit_title=PR_TITLE, merge_commit_message=PR_BODY already set"
+    return 0
+  fi
+
+  if [ "$MODE" = "check" ]; then
+    [ "$title" = "PR_TITLE" ] || miss "merge_commit_title" "is '$title' (want PR_TITLE)"
+    [ "$msg"   = "PR_BODY"  ] || miss "merge_commit_message" "is '$msg' (want PR_BODY)"
+    return 0
+  fi
+
+  local body='{"merge_commit_title":"PR_TITLE","merge_commit_message":"PR_BODY"}'
+  if [ "$MODE" = "dry-run" ]; then
+    api_call PATCH "repos/$OWNER_REPO" "$body"
+  else
+    api_call PATCH "repos/$OWNER_REPO" "$body" >/dev/null
+  fi
+  ok "merge_commit_title=PR_TITLE, merge_commit_message=PR_BODY"
+}
+
+# ----------------------------------------------------------------------------
+# Step 7: lock merge mode to --no-ff merge commits only.
+#
+# Disables squash merges and rebase merges; keeps merge commits enabled.
+# The v4rian model relies on every PR producing a single merge commit
+# whose subject + body are the auditable record of the change.
+# ----------------------------------------------------------------------------
+step_merge_mode_lock() {
+  hdr "step 7: merge mode lock (no-ff merge commits only)"
+  local resp squash rebase merge
+  resp=$(curl -sS \
+    -H "Authorization: token $TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/$OWNER_REPO" 2>/dev/null || true)
+  squash=$(printf '%s' "$resp" | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(str(d.get('allow_squash_merge','')).lower())
+except Exception:
+    print('')" 2>/dev/null || true)
+  rebase=$(printf '%s' "$resp" | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(str(d.get('allow_rebase_merge','')).lower())
+except Exception:
+    print('')" 2>/dev/null || true)
+  merge=$(printf '%s' "$resp" | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(str(d.get('allow_merge_commit','')).lower())
+except Exception:
+    print('')" 2>/dev/null || true)
+
+  if [ "$squash" = "false" ] && [ "$rebase" = "false" ] && [ "$merge" = "true" ]; then
+    ok "merge mode already locked (squash off, rebase off, merge on)"
+    return 0
+  fi
+
+  if [ "$MODE" = "check" ]; then
+    [ "$squash" = "false" ] || miss "allow_squash_merge" "is '$squash' (want false)"
+    [ "$rebase" = "false" ] || miss "allow_rebase_merge" "is '$rebase' (want false)"
+    [ "$merge"  = "true"  ] || miss "allow_merge_commit"  "is '$merge' (want true)"
+    return 0
+  fi
+
+  local body='{"allow_squash_merge":false,"allow_rebase_merge":false,"allow_merge_commit":true}'
+  if [ "$MODE" = "dry-run" ]; then
+    api_call PATCH "repos/$OWNER_REPO" "$body"
+  else
+    api_call PATCH "repos/$OWNER_REPO" "$body" >/dev/null
+  fi
+  ok "merge mode locked (squash off, rebase off, merge on)"
+}
+
+# ----------------------------------------------------------------------------
+# Step 8: disable auto-delete of merged branches.
+#
+# The v4rian claim flow archives every merged pool branch to its paired
+# vault/nN.kind.short-name ref. If GitHub auto-deletes the head branch on
+# merge, the archive step has nothing to rename and loses the institutional
+# memory of the merged work.
+# ----------------------------------------------------------------------------
+step_disable_auto_delete() {
+  hdr "step 8: disable auto-delete of merged branches"
+  local resp current
+  resp=$(curl -sS \
+    -H "Authorization: token $TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/repos/$OWNER_REPO" 2>/dev/null || true)
+  current=$(printf '%s' "$resp" | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(str(d.get('delete_branch_on_merge','')).lower())
+except Exception:
+    print('')" 2>/dev/null || true)
+
+  if [ "$current" = "false" ]; then
+    ok "delete_branch_on_merge already false"
+    return 0
+  fi
+
+  if [ "$MODE" = "check" ]; then
+    miss "delete_branch_on_merge" "is '$current' (want false)"
+    return 0
+  fi
+
+  local body='{"delete_branch_on_merge":false}'
+  if [ "$MODE" = "dry-run" ]; then
+    api_call PATCH "repos/$OWNER_REPO" "$body"
+  else
+    api_call PATCH "repos/$OWNER_REPO" "$body" >/dev/null
+  fi
+  ok "delete_branch_on_merge=false"
+}
+
+# ----------------------------------------------------------------------------
+# Step 9: repo topics for v4rian identification.
+#
+# Adds topics 'v4rian' and 'how-git' to the repo if not already present.
+# Existing topics on the repo are preserved — the new topics are merged
+# into the current list rather than replacing it.
+# ----------------------------------------------------------------------------
+step_topics() {
+  hdr "step 9: repo topics (v4rian, how-git)"
+  local resp current_json wanted="v4rian how-git"
+  resp=$(curl -sS \
+    -H "Authorization: token $TOKEN" \
+    -H "Accept: application/vnd.github.mercy-preview+json" \
+    "https://api.github.com/repos/$OWNER_REPO/topics" 2>/dev/null || true)
+  current_json=$(printf '%s' "$resp" | python3 -c "import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(json.dumps(d.get('names',[])))
+except Exception:
+    print('[]')" 2>/dev/null || echo '[]')
+
+  local missing_list
+  missing_list=$(CUR="$current_json" WANT="$wanted" python3 -c "import json,os
+cur=set(json.loads(os.environ['CUR']))
+want=os.environ['WANT'].split()
+miss=[w for w in want if w not in cur]
+print(' '.join(miss))" 2>/dev/null || echo "")
+
+  if [ -z "$missing_list" ]; then
+    ok "topics already include v4rian + how-git"
+    return 0
+  fi
+
+  if [ "$MODE" = "check" ]; then
+    local t
+    for t in $missing_list; do
+      miss "topic '$t'" "not set on repo"
+    done
+    return 0
+  fi
+
+  # Merge wanted topics into current, preserve order of existing + appended.
+  local merged_body
+  merged_body=$(CUR="$current_json" WANT="$wanted" python3 -c "import json,os
+cur=json.loads(os.environ['CUR'])
+want=os.environ['WANT'].split()
+seen=set(cur)
+out=list(cur)
+for w in want:
+    if w not in seen:
+        out.append(w); seen.add(w)
+print(json.dumps({'names':out}))")
+  if [ "$MODE" = "dry-run" ]; then
+    api_call PUT "repos/$OWNER_REPO/topics" "$merged_body"
+  else
+    api_call PUT "repos/$OWNER_REPO/topics" "$merged_body" >/dev/null
+  fi
+  local t
+  for t in $missing_list; do
+    ok "topic '$t' added"
+  done
+}
+
+# ----------------------------------------------------------------------------
+# Step 10: final report (always prints; reads-only across all modes)
+# ----------------------------------------------------------------------------
+step_consumer_cleanup() {
+  hdr "step 9b: consumer cleanup (mark framework-internals + replace README)"
+  # The framework's own development repo ships with
+  # .io.v4rian.how-git/framework-tests/ at the root, its own README, and (forward-looking)
+  # any framework-only workflow files. When a consumer adopts the
+  # framework via Use-this-template, those files travel along. Two
+  # different treatments per file:
+  #
+  #   - .io.v4rian.how-git/framework-tests/ STAYS on consumers (pool/n47) — it serves as
+  #     the on-demand diagnostic suite that bin/doctor --deep runs to
+  #     verify the install is functionally intact. Auto-runs on push
+  #     are already gated by the FRAMEWORK_REPO marker (pool/n45's
+  #     offline-test.sh check), so keeping the directory does NOT leak
+  #     into consumer CI; it only enables manual diagnosis.
+  #   - .github/workflows/framework-self-tests.yml gets REMOVED on
+  #     consumers because a workflow file auto-fires on push regardless
+  #     of internal gating; it has no consumer-side purpose.
+  #   - root README.md gets REPLACED with a consumer stub only when its
+  #     md5 still matches the framework's README (consumer hasn't
+  #     edited it). Consumers who already have their own README keep it.
+  #
+  # Detection: if the FRAMEWORK_REPO marker is present, we're on the
+  # framework source repo itself; SKIP cleanup entirely. Otherwise we
+  # are a consumer; perform the (now narrower) cleanup.
+  local marker="$REPO_ROOT/.io.v4rian.how-git/FRAMEWORK_REPO"
+  if [ -f "$marker" ]; then
+    ok "FRAMEWORK_REPO marker present; this IS the framework source, skipping consumer-cleanup"
+    return 0
+  fi
+
+  local fw_tests_dir="$REPO_ROOT/framework-tests"
+  local fw_self_workflow="$REPO_ROOT/.github/workflows/framework-self-tests.yml"
+  local root_readme="$REPO_ROOT/README.md"
+  local removed=0
+
+  if [ -d "$fw_tests_dir" ]; then
+    ok ".io.v4rian.how-git/framework-tests/ kept (diagnostic suite for bin/doctor --deep)"
+  else
+    note ".io.v4rian.how-git/framework-tests/ absent (no diagnostic suite installed; bin/doctor --deep will warn)"
+  fi
+
+  if [ -f "$fw_self_workflow" ]; then
+    if [ "$MODE" = "check" ]; then
+      miss "framework-self-tests.yml" "present on this consumer repo (would remove)"
+    elif [ "$MODE" = "dry-run" ]; then
+      note "[dry-run] would remove .github/workflows/framework-self-tests.yml"
+    else
+      rm -f "$fw_self_workflow"
+      ok "removed .github/workflows/framework-self-tests.yml"
+      removed=$((removed + 1))
+    fi
+  else
+    ok ".github/workflows/framework-self-tests.yml already absent"
+  fi
+
+  # Replace root README only if it's still byte-identical to the framework's
+  # shipped root-README template (i.e. consumer has not edited it). md5
+  # compare. The template lives at .io.v4rian.how-git/templates/root-readme.template.md
+  # so it can ship with the framework without occupying repo root. The
+  # framework source repo's own root README is a byte-copy of this template
+  # (verified by a lifecycle test) so consumers post-Use-this-template
+  # inherit a root README whose md5 still matches the template.
+  local framework_readme="$REPO_ROOT/.io.v4rian.how-git/templates/root-readme.template.md"
+  if [ -f "$root_readme" ] && [ -f "$framework_readme" ]; then
+    local root_md5 fw_md5
+    if command -v md5sum >/dev/null 2>&1; then
+      root_md5=$(md5sum "$root_readme" | awk '{print $1}')
+      fw_md5=$(md5sum "$framework_readme" | awk '{print $1}')
+    else
+      root_md5=$(md5 -q "$root_readme" 2>/dev/null || echo "x")
+      fw_md5=$(md5 -q "$framework_readme" 2>/dev/null || echo "y")
+    fi
+    if [ "$root_md5" = "$fw_md5" ]; then
+      if [ "$MODE" = "check" ]; then
+        miss "README.md" "still matches framework template (would replace with consumer stub)"
+      elif [ "$MODE" = "dry-run" ]; then
+        note "[dry-run] would replace README.md with consumer stub"
+      else
+        local repo_name="${OWNER_REPO##*/}"
+        cat > "$root_readme" <<README
+# ${repo_name}
+
+Your project description here.
+README
+        ok "replaced README.md with consumer stub for ${repo_name}"
+        removed=$((removed + 1))
+      fi
+    else
+      ok "README.md already differs from framework template (consumer-owned)"
+    fi
+  fi
+
+  if [ "$MODE" != "check" ] && [ "$MODE" != "dry-run" ] && [ "$removed" -eq 0 ]; then
+    ok "no framework-internal files to clean (consumer cleanup already applied)"
+  fi
+}
+
+step_report() {
+  hdr "step 10: final state"
+  printf "  repo:          %s\n" "$OWNER_REPO"
+  printf "  mode:          %s\n" "$MODE"
+  printf "  token source:  %s\n" "$TOKEN_SRC"
+  local _alloc="${ALLOCATOR_APP_ID:-${BRANCH_CREATOR_APP_ID:-}}"
+  if [ -z "$_alloc" ] || [ "$_alloc" = "CHANGEME" ] \
+     || [ "${CI_BOT_APP_ID:-}" = "" ]   || [ "${CI_BOT_APP_ID:-CHANGEME}" = "CHANGEME" ]; then
+    printf "\n  operator follow-up required:\n"
+    printf "    1. Export ALLOCATOR_APP_ID and CI_BOT_APP_ID before re-running.\n"
+    printf "    2. Confirm in the web UI: Settings -> Rules -> verify pool-creations, safety-lockdown, vault-readonly are active.\n"
+  else
+    printf "\n  setup complete. Verify in the web UI: Settings -> Rules.\n"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+TOKEN_SRC="(none)"
+if [ -n "${GH_TOKEN:-}" ]; then
+  TOKEN_SRC='$GH_TOKEN'
+elif [ -n "${CREATE_POOL_BRANCH_TOKEN:-}" ]; then
+  TOKEN_SRC='$CREATE_POOL_BRANCH_TOKEN'
+elif command -v gh >/dev/null 2>&1 && gh auth token >/dev/null 2>&1; then
+  TOKEN_SRC='gh auth token'
+elif [ -d "$HOME/.gcm/store/git/https/github.com" ]; then
+  TOKEN_SRC='gcm credential store'
+fi
+
+TOKEN=$(resolve_token) || {
+  echo "X bootstrap-ci: no GitHub token available. Resolve one of:" >&2
+  echo "  1. export GH_TOKEN=<token>" >&2
+  echo "  2. gh auth login (after 'brew install gh' or 'sudo apt install gh')" >&2
+  echo "  3. ~/.gcm/store/git/https/github.com/<account>.credential (line 1 = token)" >&2
+  exit 3
+}
+
+OWNER_REPO=$(derive_owner_repo)
+echo "-> bootstrap-ci ($MODE) on $OWNER_REPO"
+echo "   token source: $TOKEN_SRC"
+
+step_actions_enabled
+step_workflows_enabled
+step_seed_dev
+step_apply_rules
+step_required_checks
+step_merge_commit_defaults
+step_merge_mode_lock
+step_disable_auto_delete
+step_topics
+step_consumer_cleanup
+step_report

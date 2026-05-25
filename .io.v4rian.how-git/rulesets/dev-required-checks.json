@@ -1,0 +1,28 @@
+{
+  "_comment": "v4rian dev required status checks. Names the audits and tests emitted by .github/workflows/ci-dispatch.yml on the pr-open trigger as required for any PR merge to dev. The contexts match the required.*.sh basenames (minus .sh) under .io.v4rian.how-git/ci/{tests,audits}/pr-open/. Applied via .io.v4rian.how-git/scripts/apply-repo-rules.sh, which folds these contexts into the dev branch protection rule. The check names MUST match the matrix job 'name:' fields in ci-dispatch.yml verbatim; GitHub matches required checks by exact string.",
+  "name": "v4rian-dev-required-checks",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": ["refs/heads/dev"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "required_status_checks",
+      "parameters": {
+        "strict_required_status_checks_policy": true,
+        "required_status_checks": [
+          { "context": "required.commit-audit" },
+          { "context": "required.compile" },
+          { "context": "required.coverage" },
+          { "context": "required.runtime" },
+          { "context": "required.offline-test-suites" }
+        ]
+      }
+    }
+  ],
+  "bypass_actors": []
+}

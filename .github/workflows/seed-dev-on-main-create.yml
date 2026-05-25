@@ -1,0 +1,56 @@
+name: seed-dev-on-main-create
+
+# Fires once at REPO BIRTH when GitHub creates the default branch (`main`)
+# from this template via the "Use this template" button. Pushes a paired
+# `dev` branch at the same SHA so the v4rian lifecycle Stage 0.3 invariant
+# (default branch is main; dev is present from day one) is satisfied
+# automatically; no `heal.sh` follow-up required.
+#
+# The workflow's logic is intentionally narrow:
+#   - Fires on `create` for the `main` ref only.
+#   - No-op if `dev` already exists on origin (e.g. a downstream consumer
+#     pushed it themselves, or the template owner re-ran a heal).
+#   - Pushes `refs/heads/dev` at the current main SHA otherwise.
+#
+# This complements `heal.sh`'s repair-style dev-seeding step: `heal.sh`
+# fixes drift if dev went missing post-bootstrap, this workflow ensures
+# dev is THERE from the very first second the new repo exists.
+#
+# Like all `on: create` workflows, this file must live on the repo's
+# default branch (main) to fire at all; the `create` event reads only
+# from the default branch.
+
+on:
+  create
+
+permissions:
+  contents: write
+
+jobs:
+  seed:
+    if: ${{ github.event.ref_type == 'branch' && github.event.ref == 'main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (need write token)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity for the bot push
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Seed dev at main's SHA (if not already on origin)
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --heads origin dev | grep -q 'refs/heads/dev$'; then
+            echo "→ dev already exists on origin; no-op"
+            exit 0
+          fi
+          echo "→ seeding dev at $SHA (paired with main at repo birth)"
+          git push origin "$SHA:refs/heads/dev"
+          echo "✓ dev created at $SHA"

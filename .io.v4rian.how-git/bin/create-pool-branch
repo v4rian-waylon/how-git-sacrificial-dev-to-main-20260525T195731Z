@@ -1,0 +1,293 @@
+#!/usr/bin/env bash
+# create-pool-branch — local CLI wrapper around the allocator script.
+#
+# In connected mode, dispatches .github/workflows/allocate-pool-branch.yml
+# via `gh workflow run` so the canonical
+# .io.v4rian.how-git/scripts/allocate-pool-branch.sh runs server-side
+# against the GITHUB_TOKEN identity that the repository rulesets are
+# pinned to. No mutation happens locally.
+#
+# In off-grid mode, invokes the same canonical allocator script LOCALLY
+# (ALLOC_MODE=off-grid) so the script creates the pool+safety pair as
+# local refs in the working copy. No GitHub workflow is dispatched. The
+# off-grid invariant is that the operator workflow replicates connected
+# mode exactly; only the under-the-hood implementation differs.
+#
+# Configuration:
+#
+#   --repo OWNER/REPO   Override the target repo. Defaults to the
+#                       origin remote of the current working copy when
+#                       inside a git repo. Ignored in off-grid mode.
+#   --token VAL         Override the GitHub token. Defaults to the
+#                       chain GH_TOKEN -> CREATE_POOL_BRANCH_TOKEN ->
+#                       `gh auth token`. Ignored in off-grid mode.
+#   --no-jira           Off-grid-only escape hatch for callers without
+#                       a JIRA Automation pipeline. Synthesises a
+#                       branch name without the JIRA segment instead of
+#                       fabricating a placeholder key.
+#
+# Advisory admin check (connected only): queries the current logged-in
+# user's permission on the target repo via `gh api` and refuses to
+# dispatch when the role is not admin. Determined bypass is possible
+# by invoking gh directly; the workflow itself re-runs the same check
+# server-side and the repository rulesets are the final authority.
+# Off-grid mode skips the advisory check; the admin gate there is the
+# local finalize-pool-merge admins.txt check at close-up time.
+#
+# Usage:
+#   create-pool-branch <short_name> --jira KEY-NNN [--kind KIND] [--sprint N]
+#                                   [--requirement TEXT | --requirement-file PATH]
+#                                   [--dry-run] [--json]
+#   create-pool-branch <short_name> --no-jira       [--kind KIND] [--sprint N]
+#                                   [--requirement TEXT | --requirement-file PATH]
+#                                   [--dry-run] [--json]    # off-grid only
+#
+# Examples:
+#   create-pool-branch parser-rewrite --jira PROJ-123 --kind feature
+#   create-pool-branch token-leak --jira SEC-9 --kind fix --sprint 4
+#   create-pool-branch embedding-cache --jira RND-42 --sprint 5 --dry-run
+#   create-pool-branch parser-rewrite --jira PROJ-123 --requirement-file ./req.txt
+#   create-pool-branch parser-rewrite --jira PROJ-123 --requirement "Rewrite the parser to handle nested blocks."
+#   create-pool-branch local-only --no-jira --kind feature              # off-grid
+#
+# When --requirement (or --requirement-file) is supplied, the allocator
+# stamps the text into the active-requirement file plus the body of the
+# initial [REQ] commit on the pool branch. Auditors and the smart-commit
+# tool fetch the text via .io.v4rian.how-git/scripts/get-active-requirement.sh
+# when invoking claude.
+
+set -euo pipefail
+
+# Source the shared library so the mode accessor (get_mode) is available
+# without re-implementing the MODE file read here. The library is sourced
+# (not executed) so no side effects fire.
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+NS_DIR=$(dirname "$SCRIPT_DIR")
+ALLOC_SCRIPT="$NS_DIR/scripts/allocate-pool-branch.sh"
+# shellcheck source=../scripts/_lib.sh
+. "$NS_DIR/scripts/_lib.sh"
+
+# --- Defaults ---
+REPO=""
+TOKEN="${GH_TOKEN:-${CREATE_POOL_BRANCH_TOKEN:-}}"
+KIND=""
+SHORT=""
+JIRA=""
+SPRINT=""
+REQUIREMENT=""
+REQUIREMENT_FILE=""
+JSON_OUT=false
+DRY_RUN=false
+NO_JIRA=false
+
+usage() {
+  sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+# --- Parse positional args ---
+if [ $# -lt 1 ]; then
+  usage 2
+fi
+
+SHORT="$1"; shift
+
+# --- Parse flags ---
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --kind)              KIND="$2"; shift 2 ;;
+    --jira)              JIRA="$2"; shift 2 ;;
+    --sprint)            SPRINT="$2"; shift 2 ;;
+    --requirement)       REQUIREMENT="$2"; shift 2 ;;
+    --requirement-file)  REQUIREMENT_FILE="$2"; shift 2 ;;
+    --repo)              REPO="$2"; shift 2 ;;
+    --token)             TOKEN="$2"; shift 2 ;;
+    --no-jira)           NO_JIRA=true; shift ;;
+    --json)              JSON_OUT=true; shift ;;
+    --dry-run)           DRY_RUN=true; shift ;;
+    -h|--help)           usage 0 ;;
+    *) echo "create-pool-branch: unknown flag: $1" >&2; usage 2 ;;
+  esac
+done
+
+# --requirement-file overrides --requirement (matches allocator semantics).
+if [ -n "$REQUIREMENT_FILE" ]; then
+  if [ ! -f "$REQUIREMENT_FILE" ]; then
+    echo "create-pool-branch: requirement file '$REQUIREMENT_FILE' does not exist" >&2
+    exit 2
+  fi
+  REQUIREMENT=$(cat "$REQUIREMENT_FILE")
+fi
+
+# --- Resolve mode (used for validation gating below) ---
+MODE_VAL=$(get_mode 2>/dev/null || echo "connected")
+
+# --- Validate ---
+if $NO_JIRA; then
+  if [ "$MODE_VAL" != "off-grid" ]; then
+    echo "create-pool-branch: --no-jira is off-grid-only (connected mode JIRA Automation always carries a key)" >&2
+    exit 2
+  fi
+  if [ -n "$JIRA" ]; then
+    echo "create-pool-branch: --no-jira and --jira are mutually exclusive" >&2
+    exit 2
+  fi
+else
+  if [ -z "$JIRA" ]; then
+    echo "create-pool-branch: --jira KEY-NNN is required (or pass --no-jira in off-grid mode)" >&2
+    exit 2
+  fi
+  if ! [[ "$JIRA" =~ ^[A-Z]+-[0-9]+$ ]]; then
+    echo "create-pool-branch: --jira must match PROJ-NNN" >&2
+    exit 2
+  fi
+fi
+if [ -n "$KIND" ]; then
+  case "$KIND" in
+    feature|fix|r\&d|refactor|reconcile|doc) ;;
+    *)
+      echo "create-pool-branch: invalid --kind '$KIND' (must be feature, fix, r&d, refactor, reconcile, doc)" >&2
+      exit 2
+      ;;
+  esac
+fi
+if [ -n "$SPRINT" ] && ! [[ "$SPRINT" =~ ^[0-9]+$ ]]; then
+  echo "create-pool-branch: --sprint must be a positive integer" >&2
+  exit 2
+fi
+if [ -z "$SHORT" ]; then
+  echo "create-pool-branch: short_name is required" >&2
+  exit 2
+fi
+
+# ---------------------------------------------------------------------------
+# Off-grid path: invoke the canonical allocator script locally with
+# ALLOC_MODE=off-grid. No origin resolution, no token, no gh CLI, no
+# workflow dispatch. The allocator creates the pool+safety pair as local
+# refs via the same code path that the connected workflow runs against
+# the Git Data API.
+# ---------------------------------------------------------------------------
+if [ "$MODE_VAL" = "off-grid" ]; then
+  if [ ! -x "$ALLOC_SCRIPT" ]; then
+    echo "create-pool-branch: allocator script missing or not executable at $ALLOC_SCRIPT" >&2
+    exit 3
+  fi
+
+  ALLOC_ARGS=(--mode off-grid --short-name "$SHORT")
+  if $NO_JIRA; then
+    ALLOC_ARGS+=(--no-jira)
+  else
+    ALLOC_ARGS+=(--jira "$JIRA")
+  fi
+  [ -n "$KIND" ]              && ALLOC_ARGS+=(--kind "$KIND")
+  [ -n "$SPRINT" ]             && ALLOC_ARGS+=(--sprint "$SPRINT")
+  [ -n "$REQUIREMENT" ]        && ALLOC_ARGS+=(--requirement "$REQUIREMENT")
+  [ -n "$REQUIREMENT_FILE" ]   && ALLOC_ARGS+=(--requirement-file "$REQUIREMENT_FILE")
+
+  if $DRY_RUN; then
+    echo "[dry-run] mode: off-grid" >&2
+    echo "[dry-run] inputs: kind='${KIND:-<classify>}' short_name='$SHORT' jira_key='${JIRA:-<none>}' sprint='${SPRINT:-<none>}' requirement=${REQUIREMENT:+<supplied: ${#REQUIREMENT} chars>}${REQUIREMENT:-<none>}" >&2
+    echo "[dry-run] would call: bash $ALLOC_SCRIPT ${ALLOC_ARGS[*]}" >&2
+    exit 0
+  fi
+
+  if $JSON_OUT; then
+    bash "$ALLOC_SCRIPT" "${ALLOC_ARGS[@]}"
+  else
+    OUT=$(bash "$ALLOC_SCRIPT" "${ALLOC_ARGS[@]}") || { echo "$OUT"; exit 1; }
+    printf '%s\n' "$OUT"
+    BRANCH=$(printf '%s' "$OUT" | grep -oE '"branch_name":[[:space:]]*"[^"]+"' | head -1 | sed -E 's|.*"branch_name":[[:space:]]*"([^"]+)".*|\1|')
+    [ -n "$BRANCH" ] && echo "✓ pool+safety pair allocated locally: $BRANCH"
+    echo "  (off-grid mode; no workflow dispatched, no remote push)"
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# Connected path: dispatch the allocator workflow on the target repo so
+# the canonical script runs server-side against the GITHUB_TOKEN identity
+# that the repository rulesets are pinned to.
+# ---------------------------------------------------------------------------
+
+# --- Resolve repo from origin when not supplied ---
+if [ -z "$REPO" ]; then
+  REMOTE_URL=$(git config --get remote.origin.url 2>/dev/null || true)
+  if [ -z "$REMOTE_URL" ]; then
+    echo "create-pool-branch: --repo not supplied and origin remote is not set" >&2
+    exit 2
+  fi
+  REPO=$(echo "$REMOTE_URL" | sed -E 's|^https?://[^/]+/||; s|^git@[^:]+:||; s|\.git$||')
+fi
+
+# --- gh CLI required ---
+if ! command -v gh >/dev/null 2>&1; then
+  echo "create-pool-branch: gh CLI is required (install: brew install gh)" >&2
+  exit 3
+fi
+
+# --- Token resolution (gh's own auth chain as fallback) ---
+if [ -z "$TOKEN" ]; then
+  TOKEN=$(gh auth token 2>/dev/null || true)
+fi
+if [ -z "$TOKEN" ]; then
+  echo "create-pool-branch: no GitHub token available (set GH_TOKEN, CREATE_POOL_BRANCH_TOKEN, or run 'gh auth login')" >&2
+  exit 3
+fi
+
+# --- Advisory admin permission check ---
+admin_check() {
+  local actor perm
+  actor=$(GH_TOKEN="$TOKEN" gh api user --jq '.login' 2>/dev/null || true)
+  if [ -z "$actor" ]; then
+    echo "create-pool-branch: failed to resolve actor login (advisory check skipped)" >&2
+    return 0
+  fi
+  perm=$(GH_TOKEN="$TOKEN" gh api "repos/$REPO/collaborators/$actor/permission" --jq '.permission' 2>/dev/null || echo "unknown")
+  if [ "$perm" != "admin" ]; then
+    echo "✗ refusing to dispatch: actor '$actor' has permission '$perm' on $REPO (admin required)" >&2
+    echo "  (advisory local guard; the workflow re-checks server side and rulesets are the final authority)" >&2
+    return 1
+  fi
+  echo "  ✓ actor=$actor permission=admin on $REPO" >&2
+  return 0
+}
+
+if $DRY_RUN; then
+  echo "[dry-run] target repo: $REPO" >&2
+  echo "[dry-run] inputs: kind='${KIND:-<classify>}' short_name='$SHORT' jira_key='$JIRA' sprint='${SPRINT:-<none>}' requirement=${REQUIREMENT:+<supplied: ${#REQUIREMENT} chars>}${REQUIREMENT:-<none>}" >&2
+  admin_check || true
+  echo "[dry-run] would call: gh workflow run allocate-pool-branch.yml -R $REPO -f kind=... -f short_name=... -f jira_key=... [-f sprint=...] [-f requirement=...]" >&2
+  exit 0
+fi
+
+admin_check || exit 4
+
+# --- Dispatch the workflow ---
+ARGS=(-R "$REPO" -f "short_name=$SHORT" -f "jira_key=$JIRA")
+[ -n "$KIND" ]        && ARGS+=(-f "kind=$KIND")
+[ -n "$SPRINT" ]      && ARGS+=(-f "sprint=$SPRINT")
+[ -n "$REQUIREMENT" ] && ARGS+=(-f "requirement=$REQUIREMENT")
+
+GH_TOKEN="$TOKEN" gh workflow run allocate-pool-branch.yml "${ARGS[@]}"
+
+# Resolve the run we just kicked off (best effort, by recency)
+RUN_INFO=""
+for i in 1 2 3 4 5; do
+  sleep 1
+  RUN_INFO=$(GH_TOKEN="$TOKEN" gh run list -R "$REPO" --workflow=allocate-pool-branch.yml --limit 1 --json databaseId,url,status,headBranch,event 2>/dev/null || true)
+  [ -n "$RUN_INFO" ] && break
+done
+
+if $JSON_OUT; then
+  printf '%s\n' "${RUN_INFO:-{}}"
+  exit 0
+fi
+
+if [ -n "$RUN_INFO" ]; then
+  URL=$(printf '%s' "$RUN_INFO" | sed -nE 's/.*"url":[[:space:]]*"([^"]+)".*/\1/p')
+  echo "✓ allocator workflow dispatched on $REPO"
+  [ -n "$URL" ] && echo "  watch: $URL"
+  echo "  (the workflow output JSON includes branch_name and branch_url; tail with: gh run watch -R $REPO)"
+else
+  echo "✓ allocator workflow dispatched on $REPO (run lookup unavailable; check the Actions tab)"
+fi

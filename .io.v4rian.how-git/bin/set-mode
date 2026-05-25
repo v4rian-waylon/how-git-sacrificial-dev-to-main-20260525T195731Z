@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# set-mode — flip the v4rian repo mode between connected and off-grid.
+#
+# Modes:
+#   connected — claim ceremonies (title amend + tag + vault) run on the
+#               remote side via GitHub Actions. The merge can be triggered
+#               via the UI button, `init-pool-merge --merge`, or
+#               `init-release --merge`. The off-grid CLIs refuse to run.
+#   off-grid  — claim ceremonies run locally via `finalize-pool-merge`
+#               (pool→dev) or `ship` (dev→main). The connected-mode
+#               entry points (init-pool-merge, init-release, claim
+#               workflows) refuse to run.
+#
+# The mode lives in .io.v4rian.how-git/MODE and is committed to the
+# repo (mode is a repo property, not a per-clone setting). Flipping
+# is admin-gated: in connected mode, the actor's GitHub admin
+# permission is checked via the collaborators API before the flip is
+# committed. In off-grid mode there is no enforceable admin check
+# locally; the operator is trusted (advisory warning only).
+#
+# Usage:
+#   set-mode connected           flip to connected mode
+#   set-mode off-grid            flip to off-grid mode
+#   set-mode --get               print current mode, no flip
+#   set-mode -h | --help         print this help
+
+set -euo pipefail
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+[ -z "$REPO_ROOT" ] && { echo "X set-mode: not inside a git repo" >&2; exit 2; }
+
+MODE_FILE="$REPO_ROOT/.io.v4rian.how-git/MODE"
+[ -f "$MODE_FILE" ] || { echo "X set-mode: $MODE_FILE missing - is this a v4rian-bootstrapped repo?" >&2; exit 2; }
+
+CURRENT=$(tr -d '\n' < "$MODE_FILE")
+
+case "${1:-}" in
+  --get)
+    echo "$CURRENT"
+    exit 0
+    ;;
+  -h|--help)
+    sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+  connected|off-grid)
+    NEW="$1"
+    ;;
+  *)
+    echo "X set-mode: expected 'connected' or 'off-grid' (got '${1:-<empty>}')" >&2
+    echo "  current mode: $CURRENT" >&2
+    exit 2
+    ;;
+esac
+
+if [ "$NEW" = "$CURRENT" ]; then
+  echo "-> already in $CURRENT mode; no change"
+  exit 0
+fi
+
+# Admin gate. Skipped under LIFECYCLE_TEST_MODE=1 (the offline test rig that
+# exercises mode flips against scratch repos with no GitHub remote).
+if [ "${LIFECYCLE_TEST_MODE:-}" = "1" ]; then
+  echo "! LIFECYCLE_TEST_MODE: admin gate bypassed"
+elif [ "$CURRENT" = "connected" ]; then
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "X set-mode: gh CLI required to verify admin permission in connected mode" >&2
+    exit 3
+  fi
+  ORIGIN_URL=$(git -C "$REPO_ROOT" config --get remote.origin.url 2>/dev/null || true)
+  if [ -z "$ORIGIN_URL" ]; then
+    echo "X set-mode: connected mode but no origin remote configured - inconsistent state" >&2
+    exit 3
+  fi
+  REPO=$(echo "$ORIGIN_URL" | sed -E 's|^https?://[^/]+/||; s|^git@[^:]+:||; s|\.git$||')
+  ACTOR=$(gh api /user --jq '.login' 2>/dev/null || echo "")
+  [ -z "$ACTOR" ] && { echo "X set-mode: gh not authenticated; cannot verify admin permission" >&2; exit 3; }
+  PERM=$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq '.permission' 2>/dev/null || echo "unknown")
+  if [ "$PERM" != "admin" ]; then
+    echo "X set-mode: actor '${ACTOR}' has permission '${PERM}' on ${REPO} but admin is required to flip the mode" >&2
+    exit 3
+  fi
+  echo "-> admin gate ok (actor=${ACTOR} permission=${PERM})"
+else
+  echo "! off-grid mode: admin gate is advisory only - trusting the operator"
+fi
+
+echo "$NEW" > "$MODE_FILE"
+echo "-> MODE updated: $CURRENT -> $NEW"
+
+cd "$REPO_ROOT"
+git add .io.v4rian.how-git/MODE
+git commit -m "[MODE] switch to $NEW" -m "Flips the v4rian repo mode from $CURRENT to $NEW. From this commit on, the $NEW-mode tooling is the only valid path for claim ceremonies; the $CURRENT-mode tooling will refuse to run."
+
+echo "v mode flip committed; push the resulting commit through your normal flow"

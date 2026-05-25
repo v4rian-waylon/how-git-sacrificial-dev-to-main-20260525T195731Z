@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# ship - off-grid one-command release. Promotes the current dev tip to main.
+#
+# In off-grid mode an admin runs ship locally to drive the dev->main release
+# without a GitHub workflow: switches to main, merges dev with --no-ff
+# (required by the v4rian model for countability), then invokes
+# claim-main-release.sh which amends the merge subject to the [MERGE] dev
+# into main: vYYYY.X spec form, force-pushes main with explicit lease,
+# attaches the GitHub Release object to the existing dev tag (same code =
+# same version, no new tag), and GCs released safety branches.
+#
+# This script REFUSES to run in connected mode. In connected mode the
+# release flow is bin/init-release (opens a dev->main PR) -> validate-pr-open
+# (server-side shielding) -> admin merges via GitHub UI -> claim-on-merge-main
+# workflow runs claim-main-release.sh in CI. Running ship locally in
+# connected mode would race the workflow.
+#
+# Safety: refuses to ship if mode is connected, if dev is empty, or if the
+# working tree is dirty.
+#
+# Usage:
+#   ship                 do it
+#   ship --dry-run       walk through the steps without mutating
+#   ship --skip-push     skip the main push (LAN/air-gapped origin scenarios)
+#   ship -h|--help       print this help
+
+set -euo pipefail
+
+usage() { sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//'; exit 0; }
+
+REPO_ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+if [ -z "$REPO_ROOT" ]; then
+  echo "X ship: not inside a git repo" >&2
+  exit 2
+fi
+
+NS_DIR="$REPO_ROOT/.io.v4rian.how-git"
+# shellcheck source=../scripts/_lib.sh
+. "$NS_DIR/scripts/_lib.sh"
+
+DRY_RUN=false
+SKIP_PUSH=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run)  DRY_RUN=true; shift ;;
+    --skip-push) SKIP_PUSH=true; shift ;;
+    -h|--help) usage ;;
+    *) echo "X unknown flag: $1" >&2; exit 2 ;;
+  esac
+done
+
+cd "$REPO_ROOT"
+
+# ---------------------------------------------------------------------------
+# Mode gate — off-grid only
+# ---------------------------------------------------------------------------
+MODE_VAL=$(get_mode)
+if [ "$MODE_VAL" != "off-grid" ]; then
+  echo "X ship: repo is in '$MODE_VAL' mode; off-grid is required." >&2
+  echo "  In connected mode the release flow is:" >&2
+  echo "    1. bin/init-release           # opens dev->main PR" >&2
+  echo "    2. <admin merges via GitHub>  # claim-on-merge-main workflow takes it from here" >&2
+  echo "  If you really need a local-only release, flip mode first:" >&2
+  echo "    bin/set-mode off-grid" >&2
+  exit 2
+fi
+
+VERSION_BIN="$NS_DIR/bin/version"
+CLAIM_MAIN="$NS_DIR/scripts/claim-main-release.sh"
+
+if [ -n "$(git status --porcelain)" ]; then
+  echo "X working tree dirty - commit or stash before shipping" >&2
+  git status --short >&2
+  exit 2
+fi
+
+if ! git rev-parse --verify --quiet dev >/dev/null 2>&1; then
+  echo "X dev branch does not exist; nothing to ship" >&2
+  exit 2
+fi
+
+# Compute the release version up front so the local merge commit subject
+# already matches the spec form claim-main-release will derive. When the
+# subjects match the claim's amend block is a no-op.
+RELEASE_TAG=$("$VERSION_BIN" --release-tag)
+MERGE_SUBJECT="[MERGE] dev into main: $RELEASE_TAG"
+
+echo "-> shipping release: $RELEASE_TAG (off-grid)"
+
+if $DRY_RUN; then
+  echo "[dry-run] would:"
+  echo "  1. git checkout main"
+  if ! $SKIP_PUSH; then
+    echo "  2. git pull --ff-only origin main (origin reachable check)"
+  fi
+  echo "  3. git merge --no-ff dev -m '$MERGE_SUBJECT'"
+  if ! $SKIP_PUSH; then
+    echo "  4. git push origin main"
+  fi
+  echo "  5. bash $CLAIM_MAIN --skip-pull"
+  exit 0
+fi
+
+echo "-> switching to main"
+git checkout -q main
+
+if ! $SKIP_PUSH; then
+  echo "-> pulling origin/main (use --skip-push to bypass when origin is unreachable)"
+  git pull -q --ff-only origin main || {
+    echo "  ! pull failed; if your origin is offline (LAN/air-gapped), re-run with --skip-push" >&2
+    exit 2
+  }
+fi
+
+echo "-> merging dev --no-ff with spec subject"
+git merge --no-ff dev -m "$MERGE_SUBJECT"
+
+if ! $SKIP_PUSH; then
+  echo "-> pushing main"
+  git push -q origin main
+fi
+
+CLAIM_ARGS=(--skip-pull)
+$SKIP_PUSH && CLAIM_ARGS+=(--no-release)
+echo "-> invoking $CLAIM_MAIN ${CLAIM_ARGS[*]}"
+bash "$CLAIM_MAIN" "${CLAIM_ARGS[@]}"
+
+echo "ok: shipped $RELEASE_TAG"

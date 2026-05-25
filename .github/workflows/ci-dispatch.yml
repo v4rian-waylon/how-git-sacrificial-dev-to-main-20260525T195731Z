@@ -1,0 +1,197 @@
+name: ci-dispatch
+
+# Layered CI dispatcher that loops every script under
+# ci/{tests,audits}/{trigger}/ at the repo root (usr layer, consumer
+# owned) and under .io.v4rian.how-git/ci/{tests,audits}/{trigger}/
+# (sys layer, framework owned, runs only when the FRAMEWORK_REPO
+# marker is present). Each .sh becomes a separate status check whose
+# context name is the basename minus the .sh extension; required.*
+# files are bound as required checks by bin/bootstrap-ci.
+#
+# The triggers covered by this scaffolding bundle:
+#   push           every push to any branch
+#   pr-open        pull_request opened/synchronize/reopened into dev/main
+#   pr-merge-dev   pull_request closed-merged into dev
+#   pr-merge-main  pull_request closed-merged into main
+#   tag            v* tag push
+#
+# The current bundle wires push end to end as the proof of concept
+# (the prior compile / coverage / runtime / offline test suites
+# checks now live under .io.v4rian.how-git/ci/{tests,audits}/push/
+# required.*.sh; they run on the push event that lands the head SHA
+# and the PR reuses the result by context name on pr-open). The
+# opened-via-correct-flow check stays on pr-open via
+# validate-pr-open.yml. Subsequent bundles extend the other triggers
+# in the same shape.
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+
+# The pull_request event is intentionally NOT a trigger here. The
+# framework's design is that audits are push-time auditors of the head
+# SHA; when a PR opens or syncs against an already-pushed SHA, GitHub
+# branch protection looks up the required status checks by name on the
+# head SHA and finds the push-published results without re-running.
+# validate-pr-open.yml owns the pr-open work that IS specific to the PR
+# event (title + body shape, opened-via-correct-flow). Claim-on-merge
+# fires from the post-merge push to dev or main (refs/heads/dev or
+# refs/heads/main), not from the pull_request closed-merged event,
+# because both events fire at the same time and one engine is enough.
+
+permissions:
+  contents: write
+  pull-requests: write
+  statuses: write
+  checks: write
+
+# Cancel stale runs on the same ref so a quick follow-up push does
+# not race the prior fan-out.
+concurrency:
+  group: ci-dispatch-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # resolve: pick the right trigger label for this event, then list every
+  # .sh under ci/{tests,audits}/<trigger>/ across the usr + sys layers and
+  # emit the matrix in a single JSON output. Downstream jobs fan out one
+  # runner per script.
+  # ---------------------------------------------------------------------------
+  resolve:
+    name: resolve trigger and matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      trigger: ${{ steps.pick.outputs.trigger }}
+      matrix:  ${{ steps.list.outputs.matrix }}
+      empty:   ${{ steps.list.outputs.empty }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: pick trigger label
+        id: pick
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_ACTION:  ${{ github.event.action }}
+          PR_MERGED:  ${{ github.event.pull_request.merged }}
+          BASE_REF:   ${{ github.event.pull_request.base.ref }}
+          GIT_REF:    ${{ github.ref }}
+          HEAD_MSG:   ${{ github.event.head_commit.message }}
+        run: |
+          set -uo pipefail
+          trigger=""
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if [ "$PR_ACTION" = "closed" ] && [ "$PR_MERGED" = "true" ]; then
+              case "$BASE_REF" in
+                dev)  trigger="pr-merge-dev" ;;
+                main) trigger="pr-merge-main" ;;
+              esac
+            else
+              trigger="pr-open"
+            fi
+          elif [ "$EVENT_NAME" = "push" ]; then
+            # Skip the workflow's own bump commits to avoid loops on dev/main.
+            case "$HEAD_MSG" in
+              "chore(version):"*)
+                echo "=> ci-dispatch: skipping chore(version) self-push to avoid loop"
+                echo "trigger=" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+            case "$GIT_REF" in
+              refs/tags/v*)    trigger="tag" ;;
+              refs/heads/dev)  trigger="pr-merge-dev" ;;
+              refs/heads/main) trigger="pr-merge-main" ;;
+              refs/heads/*)    trigger="push" ;;
+            esac
+          fi
+          if [ -z "$trigger" ]; then
+            echo "=> ci-dispatch: no trigger label resolved for $EVENT_NAME (action=$PR_ACTION merged=$PR_MERGED base=$BASE_REF ref=$GIT_REF); nothing to do"
+            echo "trigger=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "=> ci-dispatch: trigger=$trigger"
+          echo "trigger=$trigger" >> "$GITHUB_OUTPUT"
+
+      - name: enumerate scripts
+        id: list
+        env:
+          TRIGGER: ${{ steps.pick.outputs.trigger }}
+        run: |
+          set -uo pipefail
+          if [ -z "$TRIGGER" ]; then
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Enumerate every (layer, kind, script) tuple this trigger
+          # produces. The dispatcher's --list mode emits TAB-separated
+          # lines; we transform that into the matrix include array.
+          mapfile -t lines < <(bash .io.v4rian.how-git/scripts/workflows/ci-dispatch.sh --trigger "$TRIGGER" --list)
+          if [ "${#lines[@]}" -eq 0 ]; then
+            echo "=> ci-dispatch: no scripts matched trigger=$TRIGGER"
+            echo "matrix={\"include\":[]}" >> "$GITHUB_OUTPUT"
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Build JSON via the matrix-build script. Inlined Python is unsafe
+          # here because a YAML block scalar terminates at the first
+          # dedent below the block indent, and Python's top-level
+          # statements cannot be indented to keep the block alive.
+          export LINES_JSON
+          LINES_JSON=$(printf '%s\n' "${lines[@]}" \
+            | python3 .io.v4rian.how-git/scripts/workflows/ci-dispatch-matrix-build.py)
+          echo "matrix=$LINES_JSON" >> "$GITHUB_OUTPUT"
+          echo "empty=false" >> "$GITHUB_OUTPUT"
+          echo "=> matrix: $LINES_JSON"
+
+  # ---------------------------------------------------------------------------
+  # check: one runner per discovered script. The status check name is
+  # exactly the script's check name (basename minus .sh) so branch
+  # protection bindings resolve directly to this job's name. GitHub
+  # surfaces the matrix display name in the PR conversation; we set it
+  # to the check name so the PR-side reader sees the expected gate.
+  # ---------------------------------------------------------------------------
+  check:
+    name: ${{ matrix.check }}
+    needs: resolve
+    if: needs.resolve.outputs.empty == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.resolve.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: configure local git identity for any test commits
+        run: |
+          git config --global user.name "v4rian-ci"
+          git config --global user.email "ci@v4rian.local"
+
+      - name: run ${{ matrix.layer }}/${{ matrix.kind }}/${{ matrix.basename }}
+        env:
+          CI_TRIGGER:    ${{ needs.resolve.outputs.trigger }}
+          CI_LAYER:      ${{ matrix.layer }}
+          CI_KIND:       ${{ matrix.kind }}
+          CI_CHECK_NAME: ${{ matrix.check }}
+          CI_REQUIRED:   ${{ matrix.required }}
+          LIFECYCLE_TEST_MODE: ${{ matrix.layer == 'sys' && '1' || '' }}
+          GH_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN:  ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          echo "=> ci-dispatch [$CI_TRIGGER] $CI_LAYER/$CI_KIND/${{ matrix.basename }} (required=$CI_REQUIRED)"
+          bash "${{ matrix.script }}"

@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# pre-push - branch-name regex guardrail.
+#
+# Under the new commit stage model (Step 2 of the lifecycle), the
+# heavy strategy / compile / coverage / runtime audits have moved
+# out of this hook. Two reasons:
+#
+#   1. The allocator now owns branch-shape correctness end-to-end,
+#      so the prior strategy audit largely re-checked what the
+#      remote was already going to reject.
+#   2. Compile, coverage, and runtime audits actually build and
+#      test the working tree. That belongs in CI, not on the
+#      developer's laptop.
+#
+# The async equivalents live in .github/workflows/audit-pushed-branch.yml
+# and report compile / coverage / runtime as required status checks on
+# the PR to dev. The branch-name regex stays here as the one cheap,
+# deterministic local guardrail that gives immediate feedback if
+# someone tries to push a misnamed local spike branch. Repository
+# Rules on the server are the actual enforcement.
+
+set -euo pipefail
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+
+# Protected branches push freely; claim scripts (or CI dispatchers) handle them.
+if [[ "$branch" =~ ^(main|dev)$ ]]; then
+  exit 0
+fi
+
+# The optional vYYYY.MAIN/ segment between the scope and nN matches the
+# major-version prefix introduced when active pool/safety allocation gained
+# release-line classification. Branches allocated before the prefix landed
+# stay on the flat layout and the regex accepts both. Examples are listed
+# under the rejection message below.
+pattern='^(pool|safety)/(v[0-9]{4}\.[0-9]+/)?n[0-9]+\.(feature|fix|r&d|refactor|reconcile|doc)\.(sprint[0-9]+-)?([A-Z]+-[0-9]+-)?[a-z0-9][a-z0-9-]*$'
+
+if [[ ! "$branch" =~ $pattern ]]; then
+  cat >&2 <<EOF
+X Refusing to push: branch name '$branch' is invalid.
+
+  Required:  (pool|safety)/[vYYYY.MAIN/]nN.(feature|fix|r&d|refactor|reconcile|doc).[sprintX-][JIRA-]short_name
+  Examples:  pool/n3.feature.parser-rewrite
+             pool/v2026.0/n3.feature.parser-rewrite
+             pool/n3.feature.sprint4-parser-rewrite
+             pool/v2026.0/n7.fix.PROJ-123-token-leak
+             pool/n12.r&d.sprint5-PROJ-456-embedding-cache
+             pool/v2026.0/n22.doc.runbook-rewrite
+
+  Rename:    git branch -m <new-name>
+
+  NOTE: developers cannot push new branches matching pool/* or safety/* to the
+  remote: those are allocator-only. Local branches with the right format are
+  fine for spikes; the remote will reject them on push anyway. The flat layout
+  is the legacy form kept for backwards compatibility; new allocations carry
+  the vYYYY.MAIN/ prefix that mirrors the vault and archived-safety schemes.
+  See docs/Git_Strategy.md for the full picture.
+EOF
+  exit 1
+fi

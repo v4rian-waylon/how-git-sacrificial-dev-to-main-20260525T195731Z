@@ -1,0 +1,20 @@
+{
+  "_comment": "v4rian safety/* full lockdown. Pins safety/* creation to the allocator workflow's identity (active anchors) and safety/<vYYYY.MAIN>/<suffix> creation to the claim workflow's identity (archived anchors after 3-gate GC on main release). update is blocked everywhere so any anchor SHA is immutable for the life of the branch. Combined with the pool-creations ruleset this blocks the rename-equals-delete-plus-create attack vector for developers entirely. The include patterns cover both layouts: legacy flat refs/heads/safety/<suffix> (active anchors) and current refs/heads/safety/<vYYYY.MAIN>/<suffix> (archived anchors since pool/n48 introduced the major-prefix archival scheme). Apply via .io.v4rian.how-git/scripts/apply-repo-rules.sh or bin/lockdown. The ACTOR_ID placeholder is substituted at apply time with the integration id of the GitHub Actions bot on the target repo (gh api /orgs/{org}/installations --jq '.installations[] | select(.app_slug==\"github-actions\") | .id').",
+  "name": "v4rian-safety-lockdown",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": ["refs/heads/safety/*", "refs/heads/safety/*/*"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    { "type": "creation" },
+    { "type": "update" },
+    { "type": "deletion" }
+  ],
+  "bypass_actors": [
+    { "actor_id": "{ACTOR_ID_GITHUB_ACTIONS}", "actor_type": "Integration", "bypass_mode": "always" }
+  ]
+}
