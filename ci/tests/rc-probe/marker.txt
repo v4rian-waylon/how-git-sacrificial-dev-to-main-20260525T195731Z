@@ -1,0 +1,1 @@
+sacrificial RC probe marker — proves a code change rode through the lifecycle.
